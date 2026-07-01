@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-MastiRaja Crawler – Telegram Bot Manager with HTTP Health Check
+MastiRaja Crawler – Telegram Bot Manager (Command‑Only)
 Author: Potato
+Controls: /starttask, /pause, /resume, /stop, /status, /logs, /history, /single, /ping, /help
 """
 
 import asyncio
@@ -21,7 +22,7 @@ except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-# ---------- FIX 2: ULTIMATE Identifier PATCH ----------
+# ---------- FIX 2: Patch Identifier ----------
 import aiohttp
 import aiofiles
 import aiosqlite
@@ -29,30 +30,21 @@ from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
 from pyrogram import Client
-from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
+from pyrogram.types import Message
 from pyrogram.errors import RPCError, Unauthorized, BadRequest
 from pyrogram.enums import ParseMode
 
-# ---- Patch before any usage ----
 from pyrogram.types.pyromod import Identifier
-
-# Force __annotations__ to exist
 if not hasattr(Identifier, '__annotations__'):
     setattr(Identifier, '__annotations__', {})
 Identifier.__annotations__ = {}
 
-# Also monkey-patch the matches method to be safe
 _original_matches = Identifier.matches
-
 def _patched_matches(self, data):
     try:
         return _original_matches(self, data)
     except AttributeError:
-        # If __annotations__ is missing, return False (no match) – but we already have it.
         return False
-
 Identifier.matches = _patched_matches
 
 load_dotenv()
@@ -67,6 +59,7 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 DB_FILE = os.getenv("DB_FILE", "/tmp/videos.db")
 LOG_FILE = os.getenv("LOG_FILE", "/tmp/crawler.log")
 PORT = int(os.getenv("PORT", 8000))
+AUTO_START = os.getenv("AUTO_START", "true").lower() == "true"  # start crawler on boot
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 MAX_PAGE_FETCH = 5
@@ -95,7 +88,6 @@ class CrawlerState:
         self.running = False
         self.paused = False
         self.task: Optional[asyncio.Task] = None
-        self.posts_queue: List[str] = []
         self.total_posts = 0
         self.processed = 0
         self.status = "idle"
@@ -139,11 +131,6 @@ async def mark_uploaded(post_id, file_path, title, video_url, category, tags, du
             (post_id, title, video_url, file_path, category, tags, duration, views, description, uploaded, upload_date, last_checked)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
         ''', (post_id, title, video_url, file_path, category, tags, duration, views, description))
-        await db.commit()
-
-async def update_last_checked(post_id: int):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE videos SET last_checked = datetime('now') WHERE post_id = ?", (post_id,))
         await db.commit()
 
 async def get_all_uploaded(limit: int = 20, offset: int = 0) -> List[Dict]:
@@ -357,6 +344,7 @@ async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
 async def crawl_and_process():
     async with state.lock:
         if state.running:
+            logger.info("Crawler already running.")
             return
         state.running = True
         state.paused = False
@@ -386,9 +374,9 @@ async def crawl_and_process():
         if not state.running:
             state.status = "stopped"
             state.running = False
+            logger.info("Crawler stopped during collection.")
             return
         state.total_posts = len(all_posts)
-        state.posts_queue = list(all_posts)
         logger.info(f"Found {len(all_posts)} posts.")
 
         client = Client("crawler_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, workers=10)
@@ -443,68 +431,150 @@ async def crawl_and_process():
         state.running = False
         state.status = "stopped"
 
-# ---------- Inline Keyboards ----------
-def get_main_menu():
-    buttons = [
-        [
-            InlineKeyboardButton("▶️ Start Crawler", callback_data="start"),
-            InlineKeyboardButton("⏸ Pause", callback_data="pause"),
-            InlineKeyboardButton("▶️ Resume", callback_data="resume"),
-        ],
-        [
-            InlineKeyboardButton("⏹ Stop", callback_data="stop"),
-            InlineKeyboardButton("📊 Status", callback_data="status"),
-        ],
-        [
-            InlineKeyboardButton("📄 Logs", callback_data="logs"),
-            InlineKeyboardButton("📜 History", callback_data="history"),
-        ],
-        [
-            InlineKeyboardButton("🔗 Single Download", callback_data="single"),
-            InlineKeyboardButton("❓ Help", callback_data="help"),
-            InlineKeyboardButton("🏓 Ping", callback_data="ping"),
-        ],
-    ]
-    return InlineKeyboardMarkup(buttons)
+# ---------- Command Handlers ----------
+async def start_task_cmd(client: Client, message: Message):
+    if state.running:
+        await message.reply("⚠️ Crawler is already running.")
+        return
+    state.task = asyncio.create_task(crawl_and_process())
+    await message.reply("✅ Crawler started. Use /status to monitor.")
 
-def get_history_pagination(page: int, total_pages: int):
-    buttons = []
-    nav = []
-    if page > 1:
-        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"history_{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="history_nop"))
-    if page < total_pages:
-        nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"history_{page+1}"))
-    if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")])
-    return InlineKeyboardMarkup(buttons)
+async def pause_cmd(client: Client, message: Message):
+    if not state.running:
+        await message.reply("⚠️ Crawler is not running.")
+        return
+    if state.paused:
+        await message.reply("⚠️ Already paused.")
+        return
+    state.paused = True
+    state.status = "paused"
+    await message.reply("⏸ Crawler paused. Use /resume to continue.")
 
-def get_single_cancel():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="menu")]])
+async def resume_cmd(client: Client, message: Message):
+    if not state.running:
+        await message.reply("⚠️ Crawler is not running.")
+        return
+    if not state.paused:
+        await message.reply("⚠️ Not paused.")
+        return
+    state.paused = False
+    state.status = "running"
+    await message.reply("▶️ Crawler resumed.")
 
-# ---------- Bot Handlers ----------
-async def start_cmd(client: Client, message: Message):
-    await message.reply(
-        "🤖 *MastiRaja Crawler Bot*\nUse the buttons below to control the crawler.\n\n"
-        "• /start – Show this menu\n"
-        "• /ping – Test bot responsiveness\n"
-        "• /status – Show current stats\n"
-        "• /logs – Show logs\n"
-        "• /history – Show uploaded videos\n"
-        "• /single – Upload a single video (then send URL)",
-        reply_markup=get_main_menu(),
-        parse_mode=ParseMode.MARKDOWN
+async def stop_cmd(client: Client, message: Message):
+    if not state.running:
+        await message.reply("⚠️ Crawler is not running.")
+        return
+    state.running = False
+    state.paused = False
+    state.status = "stopped"
+    if state.task and not state.task.done():
+        state.task.cancel()
+        try:
+            await state.task
+        except:
+            pass
+    await message.reply("⏹ Crawler stopped.")
+
+async def status_cmd(client: Client, message: Message):
+    pending = await get_pending_count()
+    uploaded = await get_total_uploaded_count()
+    text = (
+        f"📊 *Crawler Status*\n"
+        f"• State: `{state.status}`\n"
+        f"• Running: {state.running}\n"
+        f"• Paused: {state.paused}\n"
+        f"• Total Posts Found: {state.total_posts}\n"
+        f"• Processed: {state.processed}\n"
+        f"• Pending in DB: {pending}\n"
+        f"• Uploaded: {uploaded}"
     )
+    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
+
+async def logs_cmd(client: Client, message: Message):
+    try:
+        with open(LOG_FILE, 'r') as f:
+            lines = f.readlines()
+            tail = lines[-200:] if len(lines) > 200 else lines
+            if not tail:
+                await message.reply("📄 No logs yet.")
+                return
+            txt = ''.join(tail)
+            if len(txt) > 4000:
+                await message.reply_document(document=LOG_FILE, caption="📄 Last 200 lines of logs")
+            else:
+                await message.reply(f"📄 *Logs (last 200 lines)*\n```\n{txt}```", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await message.reply(f"❌ Error reading logs: {e}")
+
+async def history_cmd(client: Client, message: Message):
+    rows = await get_all_uploaded(limit=20, offset=0)
+    if not rows:
+        await message.reply("📭 No uploaded videos yet.")
+        return
+    text = "📜 *Last 20 uploaded videos*\n\n"
+    for row in rows:
+        text += f"• {row['title'][:50]} | {row['category']} | {row['duration']}\n"
+    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
+
+async def single_cmd(client: Client, message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("❌ Usage: `/single <post_url>`\nExample: `/single https://mastiraja.com/...`")
+        return
+    url = args[1].strip()
+    progress_msg = await message.reply("⏳ Processing single video...")
+    async with aiohttp.ClientSession() as session:
+        info = await extract_video_info(session, url)
+        if not info:
+            await progress_msg.edit_text("❌ Could not extract video info.")
+            return
+        if await is_video_uploaded(info['post_id']):
+            await progress_msg.edit_text(f"ℹ️ Video already uploaded: {info['title']}")
+            return
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        filename = os.path.join(DOWNLOAD_DIR, f"{info['post_id']}_{os.path.basename(info['video_url'])}")
+        filepath = await download_video(session, info['video_url'], filename)
+        if not filepath:
+            await progress_msg.edit_text("❌ Download failed.")
+            return
+        upload_client = Client("single_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+        await upload_client.start()
+        success = await upload_video(upload_client, filepath, info)
+        await upload_client.stop()
+        if success:
+            await mark_uploaded(info['post_id'], filepath, info['title'], info['video_url'],
+                                info['category'], info['tags'], info['duration'],
+                                info['views'], info['description'])
+            try:
+                os.remove(filepath)
+            except:
+                pass
+            await progress_msg.edit_text(f"✅ Uploaded: {info['title']}")
+        else:
+            await progress_msg.edit_text("❌ Upload failed.")
 
 async def ping_cmd(client: Client, message: Message):
     await message.reply("🏓 Pong! Bot is alive and responsive.")
 
-# ... (all other handlers remain the same as before) ...
+async def help_cmd(client: Client, message: Message):
+    text = (
+        "🤖 *MastiRaja Crawler Bot*\n\n"
+        "Available commands:\n"
+        "/starttask – Start the crawler\n"
+        "/pause – Pause the crawler\n"
+        "/resume – Resume the crawler\n"
+        "/stop – Stop the crawler\n"
+        "/status – Show current status\n"
+        "/logs – Show last 200 log lines\n"
+        "/history – Show last 20 uploaded videos\n"
+        "/single <url> – Download & upload a single video\n"
+        "/ping – Test bot responsiveness\n"
+        "/help – Show this message"
+    )
+    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
 
-# I'll include the rest of the code (handlers for start/pause/resume/stop/status/logs/history/single/help/ping/menu) – they are identical to previous version.
-
-# ---------- HTTP Health Check Server ----------
+# ---------- HTTP Health Check ----------
 async def http_server():
     from aiohttp import web
     app = web.Application()
@@ -524,7 +594,7 @@ async def main():
     await init_db()
     asyncio.create_task(http_server())
 
-    # ---- Re-apply patch inside main ----
+    # Re-patch
     from pyrogram.types.pyromod import Identifier
     if not hasattr(Identifier, '__annotations__'):
         setattr(Identifier, '__annotations__', {})
@@ -539,44 +609,53 @@ async def main():
         workers=20
     )
 
-    # ---- Validate channel ----
-    try:
-        logger.info(f"Validating channel ID: {CHANNEL_ID}")
-        chat = await app.get_chat(CHANNEL_ID)
-        logger.info(f"Channel validated: {chat.title} (ID: {chat.id})")
-    except Exception as e:
-        logger.error(f"Failed to access channel: {e}")
-        logger.error("Make sure CHANNEL_ID is correct and the bot is an admin in the channel.")
-        # Continue anyway, but upload will fail later
-
-    # ---- Register handlers ----
     @app.on_message()
     async def handle_msg(client, message):
         if not message.text:
             return
-        if state.waiting_for_single:
-            # handle single URL...
-            await handle_single_url(client, message)
-            return
-        if message.text.startswith('/'):
-            cmd = message.text.split()[0].lower()
-            if cmd == '/start':
-                await start_cmd(client, message)
-            elif cmd == '/ping':
-                await ping_cmd(client, message)
-            # ... rest of commands
-
-    @app.on_callback_query()
-    async def handle_cb(client, callback):
-        data = callback.data
-        if data == "start":
-            await start_crawler_cb(client, callback)
-        # ... rest
+        cmd = message.text.split()[0].lower()
+        if cmd == '/starttask':
+            await start_task_cmd(client, message)
+        elif cmd == '/pause':
+            await pause_cmd(client, message)
+        elif cmd == '/resume':
+            await resume_cmd(client, message)
+        elif cmd == '/stop':
+            await stop_cmd(client, message)
+        elif cmd == '/status':
+            await status_cmd(client, message)
+        elif cmd == '/logs':
+            await logs_cmd(client, message)
+        elif cmd == '/history':
+            await history_cmd(client, message)
+        elif cmd.startswith('/single'):
+            await single_cmd(client, message)
+        elif cmd == '/ping':
+            await ping_cmd(client, message)
+        elif cmd == '/help':
+            await help_cmd(client, message)
+        else:
+            await message.reply("❌ Unknown command. Use /help for available commands.")
 
     try:
         logger.info("Starting bot...")
         await app.start()
         logger.info("Bot started successfully.")
+
+        # Validate channel
+        try:
+            chat = await app.get_chat(CHANNEL_ID)
+            logger.info(f"Channel validated: {chat.title} (ID: {chat.id})")
+        except Exception as e:
+            logger.error(f"Failed to access channel: {e}")
+            logger.error("Make sure CHANNEL_ID is correct and the bot is an admin.")
+
+        # Auto‑start if enabled
+        if AUTO_START:
+            logger.info("Auto‑start enabled. Starting crawler now...")
+            state.task = asyncio.create_task(crawl_and_process())
+            await asyncio.sleep(1)  # allow the bot to respond
+
         await asyncio.Event().wait()
     except Unauthorized:
         logger.error("BOT_TOKEN is invalid! Please check your token.")
