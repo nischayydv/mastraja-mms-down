@@ -1,46 +1,51 @@
 #!/usr/bin/env python3
 """
-MastiRaja Crawler – Telegram Bot Manager (Pyrogram)
+MastiRaja Crawler – Telegram Bot Manager with HTTP Health Check
 Author: Potato
-Features: Inline keyboard control, full crawler management, single download, logs, history.
 """
 
 import asyncio
-import aiohttp
-import aiofiles
-import aiosqlite
+import sys
 import os
 import re
-import sys
 import base64
 import logging
-import time
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict
 from urllib.parse import urljoin, urlparse
 
-# ---------- FIX: Create event loop early to avoid RuntimeError in Python 3.14 ----------
+# ---------- FIX 1: Create event loop early ----------
 try:
     loop = asyncio.get_running_loop()
 except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+# ---------- FIX 2: Patch Pyrogram's Identifier ----------
+# We import pyrogram types after patching
+
+import aiohttp
+import aiofiles
+import aiosqlite
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
 # ---------- Pyrogram imports ----------
-from pyrogram import Client, filters
+from pyrogram import Client
 from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, Document, InputMediaVideo
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
-from pyrogram.errors import RPCError, FloodWait
+from pyrogram.errors import RPCError
 from pyrogram.enums import ParseMode
+
+# Apply patch before using pyrogram client
+from pyrogram.types.pyromod import Identifier
+if not hasattr(Identifier, '__annotations__'):
+    Identifier.__annotations__ = {}
 
 load_dotenv()
 
-# ========= CONFIG (from environment) ==========
+# ========= CONFIG ==========
 BASE_URL = "https://mastiraja.com"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
@@ -49,18 +54,18 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 DB_FILE = os.getenv("DB_FILE", "/tmp/videos.db")
 LOG_FILE = os.getenv("LOG_FILE", "/tmp/crawler.log")
+PORT = int(os.getenv("PORT", 8000))
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-# Concurrency limits (adjustable)
 MAX_PAGE_FETCH = 5
 MAX_VIDEO_EXTRACT = 10
 MAX_DOWNLOADS = 5
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
-# ================================================
+# ===========================
 
 if not all([API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID]):
-    raise ValueError("Missing required environment variables: API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID")
+    raise ValueError("Missing required environment variables")
 
 # ---------- Logging ----------
 logger = logging.getLogger("crawler")
@@ -72,9 +77,8 @@ ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(ch)
 
-# ---------- Global Crawler State ----------
+# ---------- Global State ----------
 class CrawlerState:
-    """Holds the current state of the crawler."""
     def __init__(self):
         self.running = False
         self.paused = False
@@ -82,15 +86,14 @@ class CrawlerState:
         self.posts_queue: List[str] = []
         self.total_posts = 0
         self.processed = 0
-        self.status = "idle"  # idle, running, paused, stopped
+        self.status = "idle"
         self.lock = asyncio.Lock()
-        self.stop_event = asyncio.Event()
+        self.waiting_for_single = False
 
 state = CrawlerState()
 
-# ---------- Database Helpers (async) ----------
+# ---------- Database ----------
 async def init_db():
-    """Initialize the SQLite database."""
     os.makedirs(os.path.dirname(DB_FILE) or '.', exist_ok=True)
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute('''
@@ -110,27 +113,14 @@ async def init_db():
             )
         ''')
         await db.commit()
-    logger.info("Database initialized.")
 
 async def is_video_uploaded(post_id: int) -> bool:
-    """Check if a video has already been uploaded."""
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute("SELECT 1 FROM videos WHERE post_id = ? AND uploaded = 1", (post_id,)) as cur:
             row = await cur.fetchone()
             return row is not None
 
-async def mark_uploaded(
-    post_id: int,
-    file_path: str,
-    title: str,
-    video_url: str,
-    category: str,
-    tags: str,
-    duration: str,
-    views: str,
-    description: str
-):
-    """Mark a video as uploaded and store its metadata."""
+async def mark_uploaded(post_id, file_path, title, video_url, category, tags, duration, views, description):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute('''
             INSERT OR REPLACE INTO videos
@@ -140,41 +130,33 @@ async def mark_uploaded(
         await db.commit()
 
 async def update_last_checked(post_id: int):
-    """Update the last_checked timestamp for a video."""
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("UPDATE videos SET last_checked = datetime('now') WHERE post_id = ?", (post_id,))
         await db.commit()
 
 async def get_all_uploaded(limit: int = 20, offset: int = 0) -> List[Dict]:
-    """Retrieve uploaded videos with pagination."""
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
             "SELECT post_id, title, category, duration, upload_date FROM videos WHERE uploaded=1 ORDER BY upload_date DESC LIMIT ? OFFSET ?",
             (limit, offset)
         ) as cur:
             rows = await cur.fetchall()
-            return [
-                {"post_id": r[0], "title": r[1], "category": r[2], "duration": r[3], "upload_date": r[4]}
-                for r in rows
-            ]
+            return [{"post_id": r[0], "title": r[1], "category": r[2], "duration": r[3], "upload_date": r[4]} for r in rows]
 
 async def get_pending_count() -> int:
-    """Get the number of videos that are not yet uploaded (stored in DB but not uploaded)."""
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute("SELECT COUNT(*) FROM videos WHERE uploaded=0") as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
 
 async def get_total_uploaded_count() -> int:
-    """Get the total number of uploaded videos."""
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute("SELECT COUNT(*) FROM videos WHERE uploaded=1") as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
 
-# ---------- Core Scraping & Download Functions ----------
-async def fetch_soup(session: aiohttp.ClientSession, url: str) -> Optional[BeautifulSoup]:
-    """Fetch a URL and return a BeautifulSoup object, with retries."""
+# ---------- Scraping Helpers ----------
+async def fetch_soup(session: aiohttp.ClientSession, url: str):
     for attempt in range(MAX_RETRIES):
         try:
             async with session.get(url, headers={'User-Agent': USER_AGENT}, timeout=REQUEST_TIMEOUT) as resp:
@@ -184,11 +166,9 @@ async def fetch_soup(session: aiohttp.ClientSession, url: str) -> Optional[Beaut
         except Exception as e:
             logger.warning(f"Fetch {url} attempt {attempt+1} failed: {e}")
             await asyncio.sleep(2 ** attempt)
-    logger.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts.")
     return None
 
 def extract_post_links(soup: BeautifulSoup) -> List[str]:
-    """Extract all post URLs from a paginated page."""
     links = []
     for article in soup.find_all('article', class_='thumb-block'):
         a = article.find('a', href=True)
@@ -201,7 +181,6 @@ def extract_post_links(soup: BeautifulSoup) -> List[str]:
     return links
 
 def extract_pagination_links(soup: BeautifulSoup) -> List[str]:
-    """Extract pagination links from the page."""
     pag = soup.find('div', class_='pagination')
     if not pag:
         return []
@@ -215,10 +194,6 @@ def extract_pagination_links(soup: BeautifulSoup) -> List[str]:
     return urls
 
 def get_highest_quality_source(decoded_html: str) -> Optional[str]:
-    """
-    Parse the decoded video player HTML and return the source with the highest quality.
-    Falls back to the first source if no quality attribute is found.
-    """
     soup = BeautifulSoup(decoded_html, 'html.parser')
     sources = soup.find_all('source')
     if not sources:
@@ -226,7 +201,6 @@ def get_highest_quality_source(decoded_html: str) -> Optional[str]:
         if video and video.get('src'):
             return video['src']
         return None
-
     best = None
     best_quality = -1
     for src_tag in sources:
@@ -234,7 +208,6 @@ def get_highest_quality_source(decoded_html: str) -> Optional[str]:
         if not src:
             continue
         quality = None
-        # Try various quality attributes
         for attr in ['quality', 'data-quality', 'bitrate', 'res']:
             val = src_tag.get(attr)
             if val:
@@ -246,7 +219,6 @@ def get_highest_quality_source(decoded_html: str) -> Optional[str]:
                 except:
                     pass
         if quality is None:
-            # Try to infer from filename (e.g., 1080p)
             m = re.search(r'(\d+)p', src)
             if m:
                 quality = int(m.group(1))
@@ -258,26 +230,17 @@ def get_highest_quality_source(decoded_html: str) -> Optional[str]:
     return best if best else (sources[-1].get('src') if sources else None)
 
 async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> Optional[Dict]:
-    """
-    Extract video metadata and the highest quality video URL from a post page.
-    """
     soup = await fetch_soup(session, post_url)
     if not soup:
         return None
-
-    # Extract post ID
     post_id = None
     m = re.search(r'/(\d+)/?$', post_url)
     if m:
         post_id = int(m.group(1))
-
-    # Title
     title_tag = soup.find('h1', itemprop='name')
     title = title_tag.get_text(strip=True) if title_tag else "Untitled"
-
-    # Video URL from iframe or video tag
-    video_url = None
     iframe = soup.find('iframe', src=True)
+    video_url = None
     if iframe:
         src = iframe['src']
         parsed = urlparse(src)
@@ -289,7 +252,6 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
                 video_url = get_highest_quality_source(decoded)
             except Exception as e:
                 logger.error(f"Decode error for {post_url}: {e}")
-
     if not video_url:
         video_tag = soup.find('video')
         if video_tag:
@@ -298,38 +260,25 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
                 source = video_tag.find('source')
                 if source:
                     video_url = source.get('src')
-
     if not video_url:
-        logger.warning(f"No video URL found for {post_url}")
         return None
-
-    # Category
     cat_tag = soup.find('a', class_='label', title=True)
     category = cat_tag.get_text(strip=True) if cat_tag else "Uncategorized"
-
-    # Tags
     tags = []
     for t in soup.find_all('a', class_='label'):
         if 'fa-tag' in str(t) or '/tag/' in t.get('href', ''):
             tags.append(t.get_text(strip=True))
     tags_str = ', '.join(tags)
-
-    # Duration
     dur = soup.find('span', class_='duration')
     duration = dur.get_text(strip=True) if dur else ''
-
-    # Views (we store it but may not display)
     views_span = soup.find('span', class_='views')
     views = views_span.get_text(strip=True).replace('i', '').strip() if views_span else ''
-
-    # Description
     desc_div = soup.find('div', class_='video-description')
     desc = ''
     if desc_div:
         p = desc_div.find('p')
         if p:
             desc = p.get_text(strip=True)
-
     return {
         'post_id': post_id,
         'title': title,
@@ -341,19 +290,9 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
         'description': desc,
     }
 
-async def download_video(
-    session: aiohttp.ClientSession,
-    video_url: str,
-    filepath: str
-) -> Optional[str]:
-    """
-    Download a video file with retries and progress display.
-    Returns the filepath on success, None on failure.
-    """
+async def download_video(session: aiohttp.ClientSession, video_url: str, filepath: str) -> Optional[str]:
     if os.path.exists(filepath):
-        logger.info(f"File already exists: {filepath}")
         return filepath
-
     for attempt in range(MAX_RETRIES):
         try:
             headers = {'User-Agent': USER_AGENT, 'Referer': BASE_URL}
@@ -366,27 +305,16 @@ async def download_video(
                         await f.write(chunk)
                         downloaded += len(chunk)
                         if total:
-                            # Progress output to console (can be captured in logs)
                             sys.stdout.write(f"\rDownloading {os.path.basename(filepath)}: {downloaded/total*100:.1f}%")
                             sys.stdout.flush()
                 sys.stdout.write("\n")
-                logger.info(f"Downloaded {filepath} ({downloaded} bytes)")
                 return filepath
         except Exception as e:
             logger.warning(f"Download attempt {attempt+1} failed: {e}")
             await asyncio.sleep(2 ** attempt)
-    logger.error(f"Failed to download {video_url}")
     return None
 
-async def upload_video(
-    client: Client,
-    filepath: str,
-    info: Dict
-) -> bool:
-    """
-    Upload a video to the Telegram channel with a formatted caption.
-    Returns True on success, False otherwise.
-    """
+async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
     caption = f"📹 *{info['title']}*\n"
     if info['category']:
         caption += f"📂 Category: {info['category']}\n"
@@ -398,176 +326,111 @@ async def upload_video(
         desc_short = info['description'][:200] + ('...' if len(info['description']) > 200 else '')
         caption += f"📝 {desc_short}\n"
     caption += f"\nUploaded by @NY_BOTS"
-
     try:
-        # Using send_video with progress callback
         await client.send_video(
             chat_id=CHANNEL_ID,
             video=filepath,
             caption=caption,
             parse_mode=ParseMode.MARKDOWN,
             supports_streaming=True,
-            progress=lambda current, total: sys.stdout.write(
-                f"\rUploading {os.path.basename(filepath)}: {current/total*100:.1f}%"
-            ) or sys.stdout.flush()
+            progress=lambda current, total: sys.stdout.write(f"\rUploading {os.path.basename(filepath)}: {current/total*100:.1f}%") or sys.stdout.flush()
         )
         sys.stdout.write("\n")
-        logger.info(f"Uploaded {filepath}")
         return True
     except RPCError as e:
-        logger.error(f"Upload error for {filepath}: {e}")
+        logger.error(f"Upload error: {e}")
         return False
 
-# ---------- The Main Crawler Task ----------
+# ---------- Crawler Task ----------
 async def crawl_and_process():
-    """
-    The main crawler coroutine. It collects all post URLs, then processes each
-    one (download + upload) with concurrency control.
-    """
     async with state.lock:
         if state.running:
-            logger.warning("Crawler already running")
             return
         state.running = True
         state.paused = False
         state.status = "running"
-        state.stop_event.clear()
         logger.info("Crawler started.")
 
     async with aiohttp.ClientSession() as session:
-        # Step 1: Collect all post URLs from all pagination pages
-        logger.info("Collecting all video URLs...")
         to_visit = [BASE_URL]
         visited = set()
         all_posts = set()
-
         while to_visit and state.running:
             if state.paused:
-                # Sleep while paused, but check stop_event periodically
                 await asyncio.sleep(2)
                 continue
-
             url = to_visit.pop()
             if url in visited:
                 continue
             visited.add(url)
-
             soup = await fetch_soup(session, url)
             if not soup:
                 continue
-
-            # Extract posts from current page
-            posts = extract_post_links(soup)
-            all_posts.update(posts)
-
-            # Add pagination links
+            all_posts.update(extract_post_links(soup))
             for p in extract_pagination_links(soup):
                 if p not in visited:
                     to_visit.append(p)
-
-            # Small delay to avoid overloading the server
             await asyncio.sleep(0.3)
-
-        # If crawler was stopped during collection, exit gracefully
         if not state.running:
-            logger.info("Crawler stopped during collection.")
             state.status = "stopped"
             state.running = False
             return
-
         state.total_posts = len(all_posts)
         state.posts_queue = list(all_posts)
         logger.info(f"Found {len(all_posts)} posts.")
 
-        # Step 2: Start pyrogram client for uploads
-        client = Client(
-            "crawler_bot",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
-            in_memory=True,
-            workers=10
-        )
+        client = Client("crawler_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, workers=10)
         await client.start()
         logger.info("Pyrogram upload client started.")
 
-        # Step 3: Process posts with concurrency control
         sem = asyncio.Semaphore(MAX_DOWNLOADS)
-        processed = 0
-
-        async def limited_process(post_url: str):
-            nonlocal processed
+        async def limited_process(post_url):
+            nonlocal state
             async with sem:
-                # Check pause/stop status before processing
                 while state.paused and state.running:
                     await asyncio.sleep(1)
                 if not state.running:
                     return
-
                 info = await extract_video_info(session, post_url)
                 if not info or not info['post_id']:
                     return
-
-                post_id = info['post_id']
-
-                # Skip if already uploaded
-                if await is_video_uploaded(post_id):
-                    logger.info(f"Post {post_id} already uploaded, skipping.")
-                    await update_last_checked(post_id)
+                if await is_video_uploaded(info['post_id']):
                     return
-
-                # Download
                 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                filename = os.path.join(DOWNLOAD_DIR, f"{post_id}_{os.path.basename(info['video_url'])}")
+                filename = os.path.join(DOWNLOAD_DIR, f"{info['post_id']}_{os.path.basename(info['video_url'])}")
                 filepath = await download_video(session, info['video_url'], filename)
                 if not filepath:
-                    logger.warning(f"Download failed for post {post_id}, skipping.")
                     return
-
-                # Upload
                 success = await upload_video(client, filepath, info)
                 if success:
                     await mark_uploaded(
-                        post_id, filepath, info['title'], info['video_url'],
+                        info['post_id'], filepath, info['title'], info['video_url'],
                         info['category'], info['tags'], info['duration'],
                         info['views'], info['description']
                     )
-                    # Clean up local file to save space
-                    try:
-                        os.remove(filepath)
-                        logger.info(f"Deleted local file {filepath}")
-                    except OSError:
-                        pass
+                    try: os.remove(filepath)
+                    except: pass
                 else:
-                    logger.warning(f"Upload failed for post {post_id}, file kept for retry.")
+                    logger.warning(f"Upload failed for post {info['post_id']}, file kept.")
+                state.processed += 1
 
-                processed += 1
-                state.processed = processed
-
-        # Create tasks for all posts
         tasks = []
-        for idx, post_url in enumerate(all_posts):
+        for url in all_posts:
             if not state.running:
                 break
-            tasks.append(asyncio.create_task(limited_process(post_url)))
-            # Check pause/stop between submissions
+            tasks.append(asyncio.create_task(limited_process(url)))
             while state.paused and state.running:
                 await asyncio.sleep(1)
             if not state.running:
                 break
-
-        # Wait for all tasks to complete
         await asyncio.gather(*tasks)
-
-        # Stop the upload client
         await client.stop()
         logger.info("Crawler finished.")
         state.running = False
         state.status = "stopped"
 
-# ---------- Inline Keyboard Definitions ----------
-def get_main_menu() -> InlineKeyboardMarkup:
-    """Return the main control menu with inline buttons."""
+# ---------- Inline Keyboards ----------
+def get_main_menu():
     buttons = [
         [
             InlineKeyboardButton("▶️ Start", callback_data="start"),
@@ -589,124 +452,93 @@ def get_main_menu() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(buttons)
 
-def get_history_pagination(page: int, total_pages: int) -> InlineKeyboardMarkup:
-    """Return pagination buttons for history."""
+def get_history_pagination(page: int, total_pages: int):
     buttons = []
-    nav_buttons = []
+    nav = []
     if page > 1:
-        nav_buttons.append(InlineKeyboardButton("◀️ Prev", callback_data=f"history_{page-1}"))
-    nav_buttons.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="history_nop"))
+        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"history_{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="history_nop"))
     if page < total_pages:
-        nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"history_{page+1}"))
-    if nav_buttons:
-        buttons.append(nav_buttons)
+        nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"history_{page+1}"))
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")])
     return InlineKeyboardMarkup(buttons)
 
-def get_single_cancel() -> InlineKeyboardMarkup:
-    """Cancel button for single download."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data="menu")]
-    ])
+def get_single_cancel():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="menu")]])
 
-# ---------- Bot Command & Callback Handlers ----------
+# ---------- Bot Handlers ----------
 async def start_cmd(client: Client, message: Message):
-    """Send the main menu when /start is issued."""
     await message.reply(
-        "🤖 *MastiRaja Crawler Bot*\n"
-        "Use the buttons below to control the crawler.",
+        "🤖 *MastiRaja Crawler Bot*\nUse the buttons below.",
         reply_markup=get_main_menu(),
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def start_crawler_callback(client: Client, callback: CallbackQuery):
-    """Start the crawler from inline button."""
+async def start_crawler_cb(client: Client, callback: CallbackQuery):
     if state.running:
-        await callback.answer("⚠️ Crawler is already running.", show_alert=True)
+        await callback.answer("Already running.", show_alert=True)
         return
     state.task = asyncio.create_task(crawl_and_process())
-    await callback.answer("✅ Crawler started.", show_alert=True)
-    await callback.message.edit_text(
-        "🔄 Crawler started. Use /status or the Status button to monitor progress.",
-        reply_markup=get_main_menu()
-    )
+    await callback.answer("Started.", show_alert=True)
+    await callback.message.edit_text("🔄 Crawler started.", reply_markup=get_main_menu())
 
-async def pause_crawler_callback(client: Client, callback: CallbackQuery):
-    """Pause the crawler from inline button."""
+async def pause_crawler_cb(client: Client, callback: CallbackQuery):
     if not state.running:
-        await callback.answer("⚠️ Crawler is not running.", show_alert=True)
+        await callback.answer("Not running.", show_alert=True)
         return
     if state.paused:
-        await callback.answer("⚠️ Crawler is already paused.", show_alert=True)
+        await callback.answer("Already paused.", show_alert=True)
         return
     state.paused = True
     state.status = "paused"
-    await callback.answer("⏸ Crawler paused.", show_alert=True)
-    await callback.message.edit_text(
-        "⏸ Crawler paused. Use Resume to continue.",
-        reply_markup=get_main_menu()
-    )
+    await callback.answer("Paused.", show_alert=True)
+    await callback.message.edit_text("⏸ Paused.", reply_markup=get_main_menu())
 
-async def resume_crawler_callback(client: Client, callback: CallbackQuery):
-    """Resume the crawler from inline button."""
+async def resume_crawler_cb(client: Client, callback: CallbackQuery):
     if not state.running:
-        await callback.answer("⚠️ Crawler is not running.", show_alert=True)
+        await callback.answer("Not running.", show_alert=True)
         return
     if not state.paused:
-        await callback.answer("⚠️ Crawler is not paused.", show_alert=True)
+        await callback.answer("Not paused.", show_alert=True)
         return
     state.paused = False
     state.status = "running"
-    await callback.answer("▶️ Crawler resumed.", show_alert=True)
-    await callback.message.edit_text(
-        "▶️ Crawler resumed.",
-        reply_markup=get_main_menu()
-    )
+    await callback.answer("Resumed.", show_alert=True)
+    await callback.message.edit_text("▶️ Resumed.", reply_markup=get_main_menu())
 
-async def stop_crawler_callback(client: Client, callback: CallbackQuery):
-    """Stop the crawler from inline button."""
+async def stop_crawler_cb(client: Client, callback: CallbackQuery):
     if not state.running:
-        await callback.answer("⚠️ Crawler is not running.", show_alert=True)
+        await callback.answer("Not running.", show_alert=True)
         return
     state.running = False
     state.paused = False
     state.status = "stopped"
     if state.task and not state.task.done():
         state.task.cancel()
-        try:
-            await state.task
-        except asyncio.CancelledError:
-            pass
-    await callback.answer("⏹ Crawler stopped.", show_alert=True)
-    await callback.message.edit_text(
-        "⏹ Crawler stopped.",
-        reply_markup=get_main_menu()
-    )
+        try: await state.task
+        except: pass
+    await callback.answer("Stopped.", show_alert=True)
+    await callback.message.edit_text("⏹ Stopped.", reply_markup=get_main_menu())
 
-async def status_callback(client: Client, callback: CallbackQuery):
-    """Show current crawler status."""
+async def status_cb(client: Client, callback: CallbackQuery):
     pending = await get_pending_count()
     uploaded = await get_total_uploaded_count()
     text = (
-        f"📊 *Crawler Status*\n"
+        f"📊 *Status*\n"
         f"• State: `{state.status}`\n"
         f"• Running: {state.running}\n"
         f"• Paused: {state.paused}\n"
-        f"• Total Posts Found: {state.total_posts}\n"
+        f"• Total: {state.total_posts}\n"
         f"• Processed: {state.processed}\n"
-        f"• Pending (in DB): {pending}\n"
-        f"• Total Uploaded: {uploaded}\n"
-        f"• Queue Size: {len(state.posts_queue)}"
+        f"• Pending DB: {pending}\n"
+        f"• Uploaded: {uploaded}"
     )
     await callback.answer()
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_main_menu(),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await callback.message.edit_text(text, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN)
 
-async def logs_callback(client: Client, callback: CallbackQuery):
-    """Show the last 200 lines of the log file."""
+async def logs_cb(client: Client, callback: CallbackQuery):
     try:
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()
@@ -716,354 +548,203 @@ async def logs_callback(client: Client, callback: CallbackQuery):
             else:
                 txt = ''.join(tail)
                 if len(txt) > 4000:
-                    # Send as file
-                    await callback.message.reply_document(
-                        document=LOG_FILE,
-                        caption="📄 Last 200 lines of logs",
-                        reply_markup=get_main_menu()
-                    )
+                    await callback.message.reply_document(document=LOG_FILE, caption="📄 Logs", reply_markup=get_main_menu())
                     await callback.answer("Logs sent as file.")
-                    # Keep the original message intact
                     return
                 else:
-                    text = f"📄 *Logs (last 200 lines)*\n```\n{txt}```"
+                    text = f"📄 *Logs*\n```\n{txt}```"
     except Exception as e:
-        text = f"❌ Error reading logs: {e}"
+        text = f"❌ Error: {e}"
     await callback.answer()
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_main_menu(),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await callback.message.edit_text(text, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN)
 
-async def history_callback(client: Client, callback: CallbackQuery, page: int = 1):
-    """Show uploaded videos with pagination."""
+async def history_cb(client: Client, callback: CallbackQuery, page: int = 1):
     per_page = 10
     offset = (page - 1) * per_page
     rows = await get_all_uploaded(limit=per_page, offset=offset)
-    total_uploaded = await get_total_uploaded_count()
-    total_pages = (total_uploaded + per_page - 1) // per_page if total_uploaded > 0 else 1
-
+    total = await get_total_uploaded_count()
+    total_pages = (total + per_page - 1) // per_page if total > 0 else 1
     if not rows:
         text = "📭 No uploaded videos yet."
         reply_markup = get_main_menu()
     else:
-        text = f"📜 *Uploaded Videos (Page {page}/{total_pages})*\n\n"
+        text = f"📜 *Uploaded (Page {page}/{total_pages})*\n\n"
         for row in rows:
             text += f"• {row['title'][:50]} | {row['category']} | {row['duration']}\n"
         reply_markup = get_history_pagination(page, total_pages)
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
+async def single_prompt_cb(client: Client, callback: CallbackQuery):
+    state.waiting_for_single = True
     await callback.answer()
     await callback.message.edit_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def single_download_prompt_callback(client: Client, callback: CallbackQuery):
-    """Prompt the user to enter a URL for single download."""
-    await callback.answer()
-    await callback.message.edit_text(
-        "🔗 Please send the full URL of the video post you want to download and upload.\n"
-        "Example: `https://mastiraja.com/some-video/`\n\n"
-        "You can cancel by pressing the button below.",
+        "🔗 Send the full URL of the video post.\nExample: `https://mastiraja.com/...`",
         reply_markup=get_single_cancel(),
         parse_mode=ParseMode.MARKDOWN
     )
-    # Store a flag in the state to indicate we're waiting for a URL
-    # We'll use a dictionary for simplicity.
-    if not hasattr(state, 'waiting_for_single'):
-        state.waiting_for_single = False
-    state.waiting_for_single = True
 
 async def handle_single_url(client: Client, message: Message):
-    """Process the user-supplied URL for single download."""
-    if not hasattr(state, 'waiting_for_single') or not state.waiting_for_single:
+    if not state.waiting_for_single:
         return
     state.waiting_for_single = False
-
     url = message.text.strip()
     if not url.startswith('http'):
-        await message.reply("❌ Invalid URL. Please provide a full http(s) URL.")
+        await message.reply("❌ Invalid URL.")
         return
-
-    progress_msg = await message.reply("⏳ Processing single video...")
-
+    progress = await message.reply("⏳ Processing single video...")
     async with aiohttp.ClientSession() as session:
         info = await extract_video_info(session, url)
         if not info:
-            await progress_msg.edit_text("❌ Could not extract video info from that URL.")
+            await progress.edit_text("❌ Could not extract info.")
             return
-
         if await is_video_uploaded(info['post_id']):
-            await progress_msg.edit_text(f"ℹ️ Video post {info['post_id']} already uploaded.")
+            await progress.edit_text("ℹ️ Already uploaded.")
             return
-
-        # Download
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         filename = os.path.join(DOWNLOAD_DIR, f"{info['post_id']}_{os.path.basename(info['video_url'])}")
         filepath = await download_video(session, info['video_url'], filename)
         if not filepath:
-            await progress_msg.edit_text("❌ Download failed.")
+            await progress.edit_text("❌ Download failed.")
             return
-
-        # Upload with a fresh client
-        upload_client = Client(
-            "single_bot",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
-            in_memory=True
-        )
+        upload_client = Client("single_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
         await upload_client.start()
         success = await upload_video(upload_client, filepath, info)
         await upload_client.stop()
-
         if success:
-            await mark_uploaded(
-                info['post_id'], filepath, info['title'], info['video_url'],
-                info['category'], info['tags'], info['duration'],
-                info['views'], info['description']
-            )
-            try:
-                os.remove(filepath)
-            except:
-                pass
-            await progress_msg.edit_text(f"✅ Successfully uploaded: {info['title']}")
+            await mark_uploaded(info['post_id'], filepath, info['title'], info['video_url'],
+                                info['category'], info['tags'], info['duration'],
+                                info['views'], info['description'])
+            try: os.remove(filepath)
+            except: pass
+            await progress.edit_text(f"✅ Uploaded: {info['title']}")
         else:
-            await progress_msg.edit_text("❌ Upload failed. Check logs.")
+            await progress.edit_text("❌ Upload failed.")
+    await progress.reply("Back to menu:", reply_markup=get_main_menu())
 
-    # Return to main menu
-    await progress_msg.reply("Return to main menu:", reply_markup=get_main_menu())
-
-async def help_callback(client: Client, callback: CallbackQuery):
-    """Show help message."""
-    text = (
-        "🤖 *MastiRaja Crawler Bot*\n\n"
-        "This bot manages a crawler that scrapes videos from MastiRaja and uploads them to your channel.\n\n"
-        "**Commands** (or use buttons):\n"
-        "• /start – Show main menu\n"
-        "• Start – Begin the full crawl\n"
-        "• Pause – Temporarily pause\n"
-        "• Resume – Continue after pause\n"
-        "• Stop – Halt the crawler\n"
-        "• Status – View current stats\n"
-        "• Logs – View latest log entries\n"
-        "• History – Show uploaded videos\n"
-        "• Single Download – Upload one specific video\n"
-        "\nMade with 🥔 by Potato."
-    )
+async def help_cb(client: Client, callback: CallbackQuery):
+    text = "🤖 Commands: start, pause, resume, stop, status, logs, history, single, help. Use /start for menu."
     await callback.answer()
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_main_menu(),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await callback.message.edit_text(text, reply_markup=get_main_menu())
 
-async def back_to_menu_callback(client: Client, callback: CallbackQuery):
-    """Return to main menu."""
+async def menu_cb(client: Client, callback: CallbackQuery):
     await callback.answer()
-    await callback.message.edit_text(
-        "🤖 *MastiRaja Crawler Bot*\nUse the buttons below to control the crawler.",
-        reply_markup=get_main_menu(),
-        parse_mode=ParseMode.MARKDOWN
+    await callback.message.edit_text("🤖 Main Menu", reply_markup=get_main_menu())
+
+# ---------- HTTP Health Check Server ----------
+async def http_server():
+    """Simple HTTP server for Render health checks."""
+    from aiohttp import web
+    app = web.Application()
+    async def health(request):
+        return web.Response(text="OK")
+    app.router.add_get('/', health)
+    app.router.add_get('/health', health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host='0.0.0.0', port=PORT)
+    await site.start()
+    logger.info(f"HTTP health server running on port {PORT}")
+    # Keep running
+    await asyncio.Event().wait()
+
+# ---------- Main ----------
+async def main():
+    await init_db()
+    # Start HTTP server in background
+    asyncio.create_task(http_server())
+
+    # Start bot
+    app = Client(
+        "mastiraja_bot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        in_memory=True,
+        workers=20
     )
 
-# ---------- Main Bot Class ----------
-class MastiRajaBot:
-    """The main bot class that sets up and runs the pyrogram client."""
-
-    def __init__(self):
-        self.app = Client(
-            "mastiraja_bot",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
-            in_memory=True,
-            workers=20,
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        # Register handlers
-        self.app.on_message()(self.handle_message)
-        self.app.on_callback_query()(self.handle_callback)
-
-    async def handle_message(self, client: Client, message: Message):
-        """Handle incoming text messages (commands and single URL input)."""
+    @app.on_message()
+    async def handle_msg(client, message):
         if not message.text:
             return
-
-        # If waiting for single URL, process it
-        if hasattr(state, 'waiting_for_single') and state.waiting_for_single:
+        if state.waiting_for_single:
             await handle_single_url(client, message)
             return
-
-        # Command handling
         if message.text.startswith('/'):
             cmd = message.text.split()[0].lower()
             if cmd == '/start':
                 await start_cmd(client, message)
             elif cmd == '/pause':
-                await pause_crawler_callback(client, message)  # Not a callback, but we can reuse
-                # Actually, we should implement separate functions for command-based pause, etc.
-                # For simplicity, we'll treat commands as text and reply with the same actions.
-                # But to keep it clean, we'll implement command handlers here.
-                if cmd == '/start':
-                    await start_cmd(client, message)
-                elif cmd == '/pause':
-                    # Reuse callback logic but adapt for message
-                    if not state.running:
-                        await message.reply("⚠️ Crawler is not running.")
-                        return
-                    if state.paused:
-                        await message.reply("⚠️ Already paused.")
-                        return
-                    state.paused = True
-                    state.status = "paused"
-                    await message.reply("⏸ Paused.")
-                elif cmd == '/resume':
-                    if not state.running:
-                        await message.reply("⚠️ Not running.")
-                        return
-                    if not state.paused:
-                        await message.reply("⚠️ Not paused.")
-                        return
-                    state.paused = False
-                    state.status = "running"
-                    await message.reply("▶️ Resumed.")
-                elif cmd == '/stop':
-                    if not state.running:
-                        await message.reply("⚠️ Not running.")
-                        return
-                    state.running = False
-                    state.paused = False
-                    state.status = "stopped"
-                    if state.task and not state.task.done():
-                        state.task.cancel()
-                        try:
-                            await state.task
-                        except:
-                            pass
-                    await message.reply("⏹ Stopped.")
-                elif cmd == '/status':
-                    pending = await get_pending_count()
-                    uploaded = await get_total_uploaded_count()
-                    text = (
-                        f"📊 *Status*\n"
-                        f"• State: `{state.status}`\n"
-                        f"• Running: {state.running}\n"
-                        f"• Paused: {state.paused}\n"
-                        f"• Total: {state.total_posts}\n"
-                        f"• Processed: {state.processed}\n"
-                        f"• Pending DB: {pending}\n"
-                        f"• Uploaded: {uploaded}"
-                    )
-                    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
-                elif cmd == '/logs':
-                    # Reuse logs callback logic
-                    try:
-                        with open(LOG_FILE, 'r') as f:
-                            lines = f.readlines()
-                            tail = lines[-200:] if len(lines) > 200 else lines
-                            if not tail:
-                                await message.reply("📄 No logs yet.")
-                            else:
-                                txt = ''.join(tail)
-                                if len(txt) > 4000:
-                                    await message.reply_document(document=LOG_FILE, caption="📄 Last 200 lines")
-                                else:
-                                    await message.reply(f"📄 *Logs*\n```\n{txt}```", parse_mode=ParseMode.MARKDOWN)
-                    except Exception as e:
-                        await message.reply(f"❌ Error: {e}")
-                elif cmd == '/history':
-                    # Show first page of history
-                    rows = await get_all_uploaded(limit=10, offset=0)
-                    total = await get_total_uploaded_count()
-                    total_pages = (total + 9) // 10 if total > 0 else 1
-                    if not rows:
-                        await message.reply("📭 No uploaded videos yet.")
-                    else:
-                        text = f"📜 *Uploaded Videos (Page 1/{total_pages})*\n\n"
-                        for row in rows:
-                            text += f"• {row['title'][:50]} | {row['category']} | {row['duration']}\n"
-                        await message.reply(text, reply_markup=get_history_pagination(1, total_pages), parse_mode=ParseMode.MARKDOWN)
-                elif cmd == '/single':
-                    # Prompt for URL
-                    await message.reply(
-                        "🔗 Please send the full URL of the video post you want to download and upload.\n"
-                        "Example: `https://mastiraja.com/some-video/`",
-                        reply_markup=get_single_cancel(),
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                    state.waiting_for_single = True
-                elif cmd == '/help':
-                    text = (
-                        "🤖 *MastiRaja Crawler Bot*\n\n"
-                        "Commands:\n"
-                        "/start – Show main menu\n"
-                        "/pause – Pause\n"
-                        "/resume – Resume\n"
-                        "/stop – Stop\n"
-                        "/status – Show status\n"
-                        "/single <url> – Download single\n"
-                        "/logs – Show logs\n"
-                        "/history – Show history\n"
-                        "/help – This message"
-                    )
-                    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
-                else:
-                    await message.reply("❌ Unknown command. Use /help.")
+                if not state.running: await message.reply("Not running.")
+                elif state.paused: await message.reply("Already paused.")
+                else: state.paused = True; state.status = "paused"; await message.reply("⏸ Paused.")
+            elif cmd == '/resume':
+                if not state.running: await message.reply("Not running.")
+                elif not state.paused: await message.reply("Not paused.")
+                else: state.paused = False; state.status = "running"; await message.reply("▶️ Resumed.")
+            elif cmd == '/stop':
+                if not state.running: await message.reply("Not running.")
+                else: state.running = False; state.paused = False; state.status = "stopped"; await message.reply("⏹ Stopped.")
+            elif cmd == '/status':
+                pending = await get_pending_count(); uploaded = await get_total_uploaded_count()
+                await message.reply(f"📊 *Status*\n• State: `{state.status}`\n• Total: {state.total_posts}\n• Processed: {state.processed}\n• Pending DB: {pending}\n• Uploaded: {uploaded}", parse_mode=ParseMode.MARKDOWN)
+            elif cmd == '/logs':
+                try:
+                    with open(LOG_FILE, 'r') as f:
+                        lines = f.readlines(); tail = lines[-200:] if len(lines)>200 else lines
+                        if tail:
+                            txt=''.join(tail)
+                            if len(txt)>4000: await message.reply_document(document=LOG_FILE, caption="Logs")
+                            else: await message.reply(f"📄 *Logs*\n```\n{txt}```", parse_mode=ParseMode.MARKDOWN)
+                        else: await message.reply("No logs.")
+                except: await message.reply("Error reading logs.")
+            elif cmd == '/history':
+                rows = await get_all_uploaded(limit=10, offset=0)
+                total = await get_total_uploaded_count()
+                total_pages = (total+9)//10 if total>0 else 1
+                if rows:
+                    text = f"📜 *History (1/{total_pages})*\n\n"
+                    for r in rows: text += f"• {r['title'][:50]} | {r['category']}\n"
+                    await message.reply(text, reply_markup=get_history_pagination(1,total_pages), parse_mode=ParseMode.MARKDOWN)
+                else: await message.reply("No uploaded videos.")
+            elif cmd == '/single':
+                state.waiting_for_single = True
+                await message.reply("Send the URL:", reply_markup=get_single_cancel())
+            elif cmd == '/help':
+                await message.reply("Commands: /start, /pause, /resume, /stop, /status, /logs, /history, /single, /help")
             else:
-                await message.reply("❌ Unknown command. Use /help.")
+                await message.reply("Unknown. Use /help.")
+        else:
+            await message.reply("Use /start for menu.")
 
-    async def handle_callback(self, client: Client, callback: CallbackQuery):
-        """Handle callback queries from inline keyboards."""
+    @app.on_callback_query()
+    async def handle_cb(client, callback):
         data = callback.data
-
-        if data == "start":
-            await start_crawler_callback(client, callback)
-        elif data == "pause":
-            await pause_crawler_callback(client, callback)
-        elif data == "resume":
-            await resume_crawler_callback(client, callback)
-        elif data == "stop":
-            await stop_crawler_callback(client, callback)
-        elif data == "status":
-            await status_callback(client, callback)
-        elif data == "logs":
-            await logs_callback(client, callback)
-        elif data == "history":
-            await history_callback(client, callback, page=1)
-        elif data == "single":
-            await single_download_prompt_callback(client, callback)
-        elif data == "help":
-            await help_callback(client, callback)
-        elif data == "menu":
-            await back_to_menu_callback(client, callback)
+        if data == "start": await start_crawler_cb(client, callback)
+        elif data == "pause": await pause_crawler_cb(client, callback)
+        elif data == "resume": await resume_crawler_cb(client, callback)
+        elif data == "stop": await stop_crawler_cb(client, callback)
+        elif data == "status": await status_cb(client, callback)
+        elif data == "logs": await logs_cb(client, callback)
+        elif data == "history": await history_cb(client, callback, page=1)
+        elif data == "single": await single_prompt_cb(client, callback)
+        elif data == "help": await help_cb(client, callback)
+        elif data == "menu": await menu_cb(client, callback)
         elif data.startswith("history_"):
             parts = data.split("_")
-            if len(parts) == 2 and parts[1].isdigit():
-                page = int(parts[1])
-                await history_callback(client, callback, page=page)
+            if len(parts)==2 and parts[1].isdigit():
+                await history_cb(client, callback, page=int(parts[1]))
             else:
                 await callback.answer("Invalid page.")
         elif data == "history_nop":
-            await callback.answer("This is the current page.")
+            await callback.answer("Current page.")
         else:
             await callback.answer("Unknown action.")
 
-    async def run(self):
-        """Start the bot and keep it running."""
-        await self.app.start()
-        logger.info("Bot started.")
-        await asyncio.Event().wait()
-
-# ---------- Entry Point ----------
-async def main():
-    """Initialize database and start the bot."""
-    await init_db()
-    bot = MastiRajaBot()
-    await bot.run()
+    logger.info("Bot started.")
+    await app.start()
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
