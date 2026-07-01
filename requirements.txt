@@ -2,6 +2,10 @@ aiohttp
 aiofiles
 aiosqlite
 beautifulsoup4
-pyroblack
 tgcrypto
 python-dotenv
+fastapi
+uvicorn
+jinja2
+pydantic
+git+https://github.com/eyMarv/pyroblack.git
