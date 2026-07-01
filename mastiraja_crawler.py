@@ -32,7 +32,7 @@ from pyrogram import Client
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
-from pyrogram.errors import RPCError, Unauthorized, InvalidApiKey
+from pyrogram.errors import RPCError, Unauthorized, BadRequest  # <-- Fixed import
 from pyrogram.enums import ParseMode
 
 from pyrogram.types.pyromod import Identifier
@@ -46,7 +46,7 @@ BASE_URL = "https://mastiraja.com"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")   # Can be @username or -1001234567890
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 DB_FILE = os.getenv("DB_FILE", "/tmp/videos.db")
 LOG_FILE = os.getenv("LOG_FILE", "/tmp/crawler.log")
@@ -324,7 +324,7 @@ async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
     caption += f"\nUploaded by @NY_BOTS"
     try:
         await client.send_video(
-            chat_id=CHANNEL_ID,
+            chat_id=CHANNEL_ID,  # Works with @username or -100 numeric ID
             video=filepath,
             caption=caption,
             parse_mode=ParseMode.MARKDOWN,
@@ -794,8 +794,11 @@ async def main():
         await asyncio.Event().wait()
     except Unauthorized:
         logger.error("BOT_TOKEN is invalid! Please check your token.")
-    except InvalidApiKey:
-        logger.error("API_ID or API_HASH is invalid!")
+    except BadRequest as e:
+        if "API_ID" in str(e) or "api_id" in str(e):
+            logger.error("API_ID or API_HASH is invalid! Please check your credentials.")
+        else:
+            logger.error(f"BadRequest error: {e}")
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
 
