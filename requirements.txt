@@ -9,3 +9,4 @@ uvicorn
 jinja2
 pydantic
 git+https://github.com/eyMarv/pyroblack.git
+yt-dlp
