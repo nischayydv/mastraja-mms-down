@@ -1,0 +1,6 @@
+aiohttp
+aiofiles
+aiosqlite
+beautifulsoup4
+pyroblack
+tgcrypto
