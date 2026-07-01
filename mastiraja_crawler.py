@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 MastiRaja Crawler – Telegram Bot Manager (Command‑Only)
-Author: Potato
 Controls: /starttask, /pause, /resume, /stop, /status, /logs, /history, /single, /ping, /help
 """
 
@@ -34,18 +33,21 @@ from pyrogram.types import Message
 from pyrogram.errors import RPCError, Unauthorized, BadRequest
 from pyrogram.enums import ParseMode
 
-from pyrogram.types.pyromod import Identifier
-if not hasattr(Identifier, '__annotations__'):
-    setattr(Identifier, '__annotations__', {})
-Identifier.__annotations__ = {}
+try:
+    from pyrogram.types.pyromod import Identifier
+    if not hasattr(Identifier, '__annotations__'):
+        setattr(Identifier, '__annotations__', {})
+    Identifier.__annotations__ = {}
 
-_original_matches = Identifier.matches
-def _patched_matches(self, data):
-    try:
-        return _original_matches(self, data)
-    except AttributeError:
-        return False
-Identifier.matches = _patched_matches
+    _original_matches = Identifier.matches
+    def _patched_matches(self, data):
+        try:
+            return _original_matches(self, data)
+        except AttributeError:
+            return False
+    Identifier.matches = _patched_matches
+except ImportError:
+    pass  # Fallback if pyromod is not installed/present
 
 load_dotenv()
 
@@ -54,12 +56,11 @@ BASE_URL = "https://mastiraja.com"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
 DB_FILE = os.getenv("DB_FILE", "/tmp/videos.db")
 LOG_FILE = os.getenv("LOG_FILE", "/tmp/crawler.log")
 PORT = int(os.getenv("PORT", 8000))
-AUTO_START = os.getenv("AUTO_START", "true").lower() == "true"  # start crawler on boot
+AUTO_START = os.getenv("AUTO_START", "true").lower() == "true"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 MAX_PAGE_FETCH = 5
@@ -67,10 +68,16 @@ MAX_VIDEO_EXTRACT = 10
 MAX_DOWNLOADS = 5
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
-# ===========================
+
+# ---------- FIX 3: Dynamic Channel ID Type Casting ----------
+raw_channel_id = os.getenv("CHANNEL_ID", "").strip()
+if raw_channel_id.startswith("-100") or raw_channel_id.isdigit() or (raw_channel_id.startswith("-") and raw_channel_id[1:].isdigit()):
+    CHANNEL_ID = int(raw_channel_id)
+else:
+    CHANNEL_ID = raw_channel_id  # Keep as string if it's a username like @MyChannel
 
 if not all([API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID]):
-    raise ValueError("Missing required environment variables")
+    raise ValueError("Missing required environment variables (API_ID, API_HASH, BOT_TOKEN, or CHANNEL_ID)")
 
 # ---------- Logging ----------
 logger = logging.getLogger("crawler")
@@ -300,12 +307,13 @@ async def download_video(session: aiohttp.ClientSession, video_url: str, filepat
                 total = int(resp.headers.get('content-length', 0))
                 downloaded = 0
                 async with aiofiles.open(filepath, 'wb') as f:
-                    async for chunk in resp.content.iter_chunked(8192):
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            sys.stdout.write(f"\rDownloading {os.path.basename(filepath)}: {downloaded/total*100:.1f}%")
-                            sys.stdout.flush()
+                    async with resp.content.iter_chunked(65536) as chunks:
+                        async for chunk in chunks:
+                            await f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                sys.stdout.write(f"\r[DOWNLOADING] {os.path.basename(filepath)}: {downloaded/total*100:.1f}%")
+                                sys.stdout.flush()
                 sys.stdout.write("\n")
                 return filepath
         except Exception as e:
@@ -325,18 +333,25 @@ async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
         desc_short = info['description'][:200] + ('...' if len(info['description']) > 200 else '')
         caption += f"📝 {desc_short}\n"
     caption += f"\nUploaded by @NY_BOTS"
+    
     try:
+        def upload_progress(current, total):
+            if total > 0:
+                sys.stdout.write(f"\r[UPLOADING] {os.path.basename(filepath)}: {current/total*100:.1f}%")
+                sys.stdout.flush()
+
         await client.send_video(
             chat_id=CHANNEL_ID,
             video=filepath,
             caption=caption,
             parse_mode=ParseMode.MARKDOWN,
             supports_streaming=True,
-            progress=lambda current, total: sys.stdout.write(f"\rUploading {os.path.basename(filepath)}: {current/total*100:.1f}%") or sys.stdout.flush()
+            progress=upload_progress
         )
         sys.stdout.write("\n")
         return True
     except RPCError as e:
+        sys.stdout.write("\n")
         logger.error(f"Upload error: {e}")
         return False
 
@@ -349,12 +364,15 @@ async def crawl_and_process():
         state.running = True
         state.paused = False
         state.status = "running"
-        logger.info("Crawler started.")
+        state.processed = 0
+        logger.info("Crawler process initiated.")
 
     async with aiohttp.ClientSession() as session:
         to_visit = [BASE_URL]
         visited = set()
         all_posts = set()
+        
+        logger.info("Collecting system post URLs...")
         while to_visit and state.running:
             if state.paused:
                 await asyncio.sleep(2)
@@ -366,41 +384,58 @@ async def crawl_and_process():
             soup = await fetch_soup(session, url)
             if not soup:
                 continue
-            all_posts.update(extract_post_links(soup))
+            
+            extracted = extract_post_links(soup)
+            all_posts.update(extracted)
+            
+            # Print changing real-time collection telemetry
+            sys.stdout.write(f"\r[SCRAPER] Collected Links: {len(all_posts)} | Visited: {len(visited)}")
+            sys.stdout.flush()
+
             for p in extract_pagination_links(soup):
                 if p not in visited:
                     to_visit.append(p)
             await asyncio.sleep(0.3)
+        
+        sys.stdout.write("\n")
+        
         if not state.running:
             state.status = "stopped"
             state.running = False
-            logger.info("Crawler stopped during collection.")
+            logger.info("Crawler stopped during initialization collection phase.")
             return
+            
         state.total_posts = len(all_posts)
-        logger.info(f"Found {len(all_posts)} posts.")
+        logger.info(f"Target Queue Loaded. Total unique links found: {state.total_posts}")
 
         client = Client("crawler_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, workers=10)
         await client.start()
-        logger.info("Pyrogram upload client started.")
 
         sem = asyncio.Semaphore(MAX_DOWNLOADS)
 
-        async def limited_process(post_url):
+        async def limited_process(post_url, index):
             async with sem:
                 while state.paused and state.running:
                     await asyncio.sleep(1)
                 if not state.running:
                     return
+                
+                logger.info(f"[Task {index}/{state.total_posts}] Parsing payload info...")
                 info = await extract_video_info(session, post_url)
                 if not info or not info['post_id']:
                     return
                 if await is_video_uploaded(info['post_id']):
+                    logger.info(f"Skipping Post ID {info['post_id']} - already indexed in database.")
+                    state.processed += 1
                     return
+                
                 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
                 filename = os.path.join(DOWNLOAD_DIR, f"{info['post_id']}_{os.path.basename(info['video_url'])}")
+                
                 filepath = await download_video(session, info['video_url'], filename)
                 if not filepath:
                     return
+                
                 success = await upload_video(client, filepath, info)
                 if success:
                     await mark_uploaded(
@@ -413,21 +448,22 @@ async def crawl_and_process():
                     except:
                         pass
                 else:
-                    logger.warning(f"Upload failed for post {info['post_id']}, file kept.")
+                    logger.warning(f"Upload failed for target {info['post_id']}. Media preserved.")
                 state.processed += 1
 
         tasks = []
-        for url in all_posts:
+        for idx, url in enumerate(all_posts, start=1):
             if not state.running:
                 break
-            tasks.append(asyncio.create_task(limited_process(url)))
+            tasks.append(asyncio.create_task(limited_process(url, idx)))
             while state.paused and state.running:
                 await asyncio.sleep(1)
-            if not state.running:
-                break
-        await asyncio.gather(*tasks)
+        
+        if tasks:
+            await asyncio.gather(*tasks)
+            
         await client.stop()
-        logger.info("Crawler finished.")
+        logger.info("Crawler run successfully finished.")
         state.running = False
         state.status = "stopped"
 
@@ -493,7 +529,7 @@ async def status_cmd(client: Client, message: Message):
 
 async def logs_cmd(client: Client, message: Message):
     try:
-        with open(LOG_FILE, 'r') as f:
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
             lines = f.readlines()
             tail = lines[-200:] if len(lines) > 200 else lines
             if not tail:
@@ -594,12 +630,6 @@ async def main():
     await init_db()
     asyncio.create_task(http_server())
 
-    # Re-patch
-    from pyrogram.types.pyromod import Identifier
-    if not hasattr(Identifier, '__annotations__'):
-        setattr(Identifier, '__annotations__', {})
-    Identifier.__annotations__ = {}
-
     app = Client(
         "mastiraja_bot",
         api_id=API_ID,
@@ -654,7 +684,7 @@ async def main():
         if AUTO_START:
             logger.info("Auto‑start enabled. Starting crawler now...")
             state.task = asyncio.create_task(crawl_and_process())
-            await asyncio.sleep(1)  # allow the bot to respond
+            await asyncio.sleep(1)
 
         await asyncio.Event().wait()
     except Unauthorized:
