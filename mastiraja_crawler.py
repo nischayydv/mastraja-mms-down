@@ -64,7 +64,7 @@ PORT = int(os.getenv("PORT", 8080))
 AUTO_START = os.getenv("AUTO_START", "true").lower() == "true"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-MAX_PAGES_TO_SCAN = 5  # Limits depth so it doesn't loop all 2000+ items every time
+MAX_PAGES_TO_SCAN = 15  
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 
@@ -94,6 +94,7 @@ class CrawlerState:
         self.running = False
         self.paused = False
         self.task: Optional[asyncio.Task] = None
+        self.http_task: Optional[asyncio.Task] = None
         self.total_posts = 0
         self.processed = 0
         self.status = "idle"
@@ -108,6 +109,13 @@ class CrawlerState:
 
 state = CrawlerState()
 
+# ---------- Helper to Clean Bad Entity Formats ----------
+def clean_for_tg(text: str) -> str:
+    """Removes or replaces characters that easily break Telegram markdown entities."""
+    if not text:
+        return ""
+    return text.replace("*", "").replace("_", "").replace("`", "").replace("<", "[").replace(">", "]")
+
 # ---------- UI Progress Monitors ----------
 def make_progress_bar(percentage: float, length: int = 10) -> str:
     percentage = max(0.0, min(100.0, percentage))
@@ -120,33 +128,36 @@ def build_live_status_text() -> str:
     overall_pct = (proc / total * 100) if total > 0 else 0.0
     overall_bar = make_progress_bar(overall_pct, length=12)
     
+    cleaned_title = clean_for_tg(state.current_title)
+    
     text = (
-        f"🔄 **MastiRaja Live Tracker**\n"
-        f"• Status: `{state.status.upper()}`\n"
-        f"• Scanning Web Page: `{state.current_page}`\n"
+        f"🔄 **MastiRaja Live Automation Monitor**\n"
+        f"• System State: `{state.status.upper()}`\n"
+        f"• Current Scan Page: `{state.current_page}`\n"
         f"─────────────────────\n"
     )
     
     if state.current_stage == "Scraping":
-        text += "🛰️ **Phase:** Extracting post links from feed indexes..."
+        text += "🛰️ **Phase:** Reading page links from site index..."
     elif state.current_stage in ["Extracting Info", "Downloading", "Uploading"]:
         text += (
-            f"📦 **Current Phase: Media Pipeline**\n"
-            f"• Batch Progress: `{proc} / {total}` links on page\n"
-            f"• Progress Bar: `[{overall_bar}] {overall_pct:.1f}%`\n\n"
-            f"🎬 **Active Title:**\n`{state.current_title[:60]}`\n"
-            f"• Current Work: `{state.current_stage}`\n"
+            f"📦 **Phase: Processing Media Pipeline**\n"
+            f"• Page Processing Queue: `{proc} / {total}` links handled\n"
+            f"• Batch Ratio: `[{overall_bar}] {overall_pct:.1f}%`\n\n"
+            f"🎬 **Active Task Target:**\n"
+            f"• Title: `{cleaned_title[:55]}`\n"
+            f"• Sub-Task: `{state.current_stage}`\n"
         )
         if state.current_stage == "Downloading":
             dl_bar = make_progress_bar(state.download_pct, length=10)
-            text += f"• **Downloading (yt-dlp):** `[{dl_bar}] {state.download_pct:.1f}%`\n"
+            text += f"• **Network Input (yt-dlp):** `[{dl_bar}] {state.download_pct:.1f}%`\n"
         elif state.current_stage == "Uploading":
             ul_bar = make_progress_bar(state.upload_pct, length=10)
-            text += f"• **Uploading (Telegram UI):** `[{ul_bar}] {state.upload_pct:.1f}%`\n"
+            text += f"• **Data Output (Telegram UI):** `[{ul_bar}] {state.upload_pct:.1f}%`\n"
     elif state.current_stage == "Finished":
-        text += f"✅ **Task Completed!** All updates published as of `{datetime.now().strftime('%H:%M:%S')}`."
+        text += f"✅ **Run Finished!** Everything is updated up to page `{state.current_page}`."
     else:
-        text += "💤 Engine is standing by on sleep interval."
+        text += "💤 Engine standing by on sleep interval."
     return text
 
 async def live_ui_refresh_loop(client: Client):
@@ -377,12 +388,19 @@ async def download_video(post_id: int, video_url: str, download_dir: str) -> Opt
     return None
 
 async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
-    caption = f"📹 *{info['title']}*\n"
-    if info['category']: caption += f"📂 Category: {info['category']}\n"
-    if info['tags']: caption += f"🏷️ Tags: {info['tags']}\n"
-    if info['duration']: caption += f"⏱️ Duration: {info['duration']}\n"
-    if info['description']:
-        caption += f"📝 {info['description'][:200]}...\n"
+    # Strings sanitized to protect entity bounds stability
+    clean_title = clean_for_tg(info['title'])
+    clean_cat = clean_for_tg(info['category'])
+    clean_tags = clean_for_tg(info['tags'])
+    clean_dur = clean_for_tg(info['duration'])
+    clean_desc = clean_for_tg(info['description'])
+
+    caption = f"📹 Title: {clean_title}\n"
+    if clean_cat: caption += f"📂 Category: {clean_cat}\n"
+    if clean_tags: caption += f"🏷️ Tags: {clean_tags}\n"
+    if clean_dur: caption += f"⏱️ Duration: {clean_dur}\n"
+    if clean_desc:
+        caption += f"📝 {clean_desc[:200]}...\n"
     caption += f"\nUploaded by @NY_BOTS"
     
     try:
@@ -440,22 +458,21 @@ async def crawl_and_process(bot_client: Client):
             state.processed = 0
             page_had_new_video = False
             
-            # True One‑by‑One Processing Loop
+            # Strict serialization layout loop
             for target_url in links:
                 while state.paused and state.running:
                     await asyncio.sleep(1)
                 if not state.running:
                     break
                     
-                # Instant DB Check before performing network lookups
                 m = re.search(r'/(\d+)/?$', target_url)
                 if m:
                     post_id = int(m.group(1))
                     if await is_video_uploaded(post_id):
+                        logger.info(f"[Page {state.current_page}] Video {post_id} already exists in DB. Skipping.")
                         state.processed += 1
-                        continue  # Skips silently without filling log lines
+                        continue 
                 
-                # We found a completely fresh item!
                 page_had_new_video = True
                 state.current_stage = "Extracting Info"
                 state.current_title = "Fetching remote metadata..."
@@ -469,15 +486,15 @@ async def crawl_and_process(bot_client: Client):
                 state.download_pct = 0.0
                 state.upload_pct = 0.0
                 
-                # Step 1: Complete Download
+                # Step 1: Sequential Download Execution
                 state.current_stage = "Downloading"
-                logger.info(f"Downloading New Target [{info['post_id']}]: {info['title']}")
+                logger.info(f"Downloading Target [{info['post_id']}]: {info['title']}")
                 filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
                 if not filepath:
                     state.processed += 1
                     continue
                     
-                # Step 2: Complete Upload
+                # Step 2: Sequential Upload Execution
                 state.current_stage = "Uploading"
                 logger.info(f"Uploading Target directly to channel: {info['title']}")
                 success = await upload_video(bot_client, filepath, info)
@@ -493,11 +510,10 @@ async def crawl_and_process(bot_client: Client):
                         pass
                 
                 state.processed += 1
-                await asyncio.sleep(2)  # Controlled interval pause between executions
+                await asyncio.sleep(2) 
             
-            # If an entire page is old videos, we are completely caught up. Stop scanning deeper.
             if not page_had_new_video:
-                logger.info("No fresh items found on this index page. Everything is up to date. Ending scan.")
+                logger.info(f"Page {state.current_page} contained only historical items. System caught up.")
                 break
                 
             state.current_page += 1
@@ -540,7 +556,7 @@ async def stop_cmd(client: Client, message: Message):
 
 async def status_cmd(client: Client, message: Message):
     uploaded = await get_total_uploaded_count()
-    await message.reply(f"📊 *Engine Status*\n• State: `{state.status}`\n• Total Synced Records: `{uploaded}`", parse_mode=ParseMode.MARKDOWN)
+    await message.reply(f"📊 Engine Status\n• State: {state.status}\n• Total Synced Records: {uploaded}")
 
 async def logs_cmd(client: Client, message: Message):
     try:
@@ -551,9 +567,9 @@ async def logs_cmd(client: Client, message: Message):
                 return
             txt = ''.join(lines)
             if len(txt) > 4000:
-                await message.reply_document(document=LOG_FILE, caption="📄 System Log Log File")
+                await message.reply_document(document=LOG_FILE, caption="📄 System Logs")
             else:
-                await message.reply(f"📄 *Logs (Last 200 Lines)*\n```\n{txt}```", parse_mode=ParseMode.MARKDOWN)
+                await message.reply(f"📄 Logs (Last 200 Lines):\n```\n{txt}```")
     except Exception as e:
         await message.reply(f"❌ Error compiling logs: {e}")
 
@@ -562,15 +578,15 @@ async def history_cmd(client: Client, message: Message):
     if not rows:
         await message.reply("📭 History is empty.")
         return
-    text = "📜 *Last 20 Uploaded Updates*\n\n"
+    text = "📜 Last 20 Uploaded Updates:\n\n"
     for row in rows:
         text += f"• {row['title'][:50]} | {row['category']}\n"
-    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
+    await message.reply(text)
 
 async def single_cmd(client: Client, message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply("❌ Usage: `/single <url>`")
+        await message.reply("❌ Usage: /single URL")
         return
     url = args[1].strip()
     progress_msg = await message.reply("⏳ Initializing single execution task...")
@@ -594,18 +610,18 @@ async def ping_cmd(client: Client, message: Message):
 
 async def help_cmd(client: Client, message: Message):
     text = (
-        "🤖 *MastiRaja Flow Controller*\n\n"
-        "/starttask – Launch real-time updater monitoring\n"
-        "/pause – Freeze active transfers\n"
-        "/resume – Unfreeze active transfers\n"
-        "/stop – Hard-terminate processing jobs\n"
-        "/status – Total index stats snapshot\n"
-        "/logs – Check runtime error readouts\n"
-        "/history – View recently deployed channel packages\n"
-        "/single <url> – Target process an isolated URL asset\n"
-        "/ping – Verify engine connectivity"
+        "🤖 MastiRaja Flow Controller\n\n"
+        "/starttask - Launch real-time updater monitoring\n"
+        "/pause - Freeze active transfers\n"
+        "/resume - Unfreeze active transfers\n"
+        "/stop - Hard-terminate processing jobs\n"
+        "/status - Total index stats snapshot\n"
+        "/logs - Check runtime error readouts\n"
+        "/history - View recently deployed channel packages\n"
+        "/single URL - Target process an isolated URL asset\n"
+        "/ping - Verify engine connectivity"
     )
-    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
+    await message.reply(text)
 
 # ---------- Network Port Interface ----------
 async def http_server():
@@ -623,7 +639,8 @@ async def http_server():
 # ---------- Program Main Loop ----------
 async def main():
     await init_db()
-    asyncio.create_task(http_server())
+    # Fixed: Retained core server background context frame mapping inside state
+    state.http_task = asyncio.create_task(http_server())
 
     app = Client(
         "mastiraja_bot",
