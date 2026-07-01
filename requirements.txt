@@ -4,3 +4,4 @@ aiosqlite
 beautifulsoup4
 pyroblack
 tgcrypto
+python-dotenv
