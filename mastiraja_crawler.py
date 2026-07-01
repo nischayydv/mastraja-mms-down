@@ -25,6 +25,7 @@ except RuntimeError:
 import aiohttp
 import aiofiles
 import aiosqlite
+import yt_dlp
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
@@ -47,7 +48,7 @@ try:
             return False
     Identifier.matches = _patched_matches
 except ImportError:
-    pass  # Fallback if pyromod is not installed/present
+    pass  # Fallback if pyromod is not present
 
 load_dotenv()
 
@@ -65,16 +66,15 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 MAX_PAGE_FETCH = 5
 MAX_VIDEO_EXTRACT = 10
-MAX_DOWNLOADS = 5
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 
-# ---------- FIX 3: Dynamic Channel ID Type Casting ----------
+# ---------- FIX 3: Channel ID Type Casting ----------
 raw_channel_id = os.getenv("CHANNEL_ID", "").strip()
 if raw_channel_id.startswith("-100") or raw_channel_id.isdigit() or (raw_channel_id.startswith("-") and raw_channel_id[1:].isdigit()):
     CHANNEL_ID = int(raw_channel_id)
 else:
-    CHANNEL_ID = raw_channel_id  # Keep as string if it's a username like @MyChannel
+    CHANNEL_ID = raw_channel_id
 
 if not all([API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID]):
     raise ValueError("Missing required environment variables (API_ID, API_HASH, BOT_TOKEN, or CHANNEL_ID)")
@@ -296,29 +296,53 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
         'description': desc,
     }
 
-async def download_video(session: aiohttp.ClientSession, video_url: str, filepath: str) -> Optional[str]:
-    if os.path.exists(filepath):
-        return filepath
-    for attempt in range(MAX_RETRIES):
-        try:
-            headers = {'User-Agent': USER_AGENT, 'Referer': BASE_URL}
-            async with session.get(video_url, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
-                resp.raise_for_status()
-                total = int(resp.headers.get('content-length', 0))
-                downloaded = 0
-                async with aiofiles.open(filepath, 'wb') as f:
-                    async with resp.content.iter_chunked(65536) as chunks:
-                        async for chunk in chunks:
-                            await f.write(chunk)
-                            downloaded += len(chunk)
-                            if total:
-                                sys.stdout.write(f"\r[DOWNLOADING] {os.path.basename(filepath)}: {downloaded/total*100:.1f}%")
-                                sys.stdout.flush()
-                sys.stdout.write("\n")
-                return filepath
-        except Exception as e:
-            logger.warning(f"Download attempt {attempt+1} failed: {e}")
-            await asyncio.sleep(2 ** attempt)
+# ---------- yt-dlp Downloader ----------
+async def download_video(post_id: int, video_url: str, download_dir: str) -> Optional[str]:
+    os.makedirs(download_dir, exist_ok=True)
+    
+    outtmpl = os.path.join(download_dir, f"{post_id}_%(title)s.%(ext)s")
+    downloaded_file = None
+
+    def progress_hook(d):
+        nonlocal downloaded_file
+        if d['status'] == 'finished':
+            downloaded_file = d['filename']
+        elif d['status'] == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            downloaded = d.get('downloaded_bytes', 0)
+            if total > 0:
+                sys.stdout.write(f"\r[DOWNLOADING via yt-dlp] {downloaded/total*100:.1f}%")
+                sys.stdout.flush()
+
+    ydl_opts = {
+        'outtmpl': outtmpl,
+        'quiet': True,
+        'no_warnings': True,
+        'progress_hooks': [progress_hook],
+        'http_headers': {
+            'User-Agent': USER_AGENT,
+            'Referer': BASE_URL
+        }
+    }
+
+    def _download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+
+    try:
+        await asyncio.to_thread(_download)
+        sys.stdout.write("\n")
+        
+        if downloaded_file and os.path.exists(downloaded_file):
+            return downloaded_file
+            
+        for file in os.listdir(download_dir):
+            if file.startswith(f"{post_id}_"):
+                return os.path.join(download_dir, file)
+    except Exception as e:
+        sys.stdout.write("\n")
+        logger.error(f"yt-dlp core downloader exception occurred: {e}")
+    
     return None
 
 async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
@@ -355,7 +379,7 @@ async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
         logger.error(f"Upload error: {e}")
         return False
 
-# ---------- Crawler Task ----------
+# ---------- Crawler Task (Modified to Sequential Loop) ----------
 async def crawl_and_process():
     async with state.lock:
         if state.running:
@@ -388,7 +412,6 @@ async def crawl_and_process():
             extracted = extract_post_links(soup)
             all_posts.update(extracted)
             
-            # Print changing real-time collection telemetry
             sys.stdout.write(f"\r[SCRAPER] Collected Links: {len(all_posts)} | Visited: {len(visited)}")
             sys.stdout.flush()
 
@@ -408,34 +431,39 @@ async def crawl_and_process():
         state.total_posts = len(all_posts)
         logger.info(f"Target Queue Loaded. Total unique links found: {state.total_posts}")
 
-        client = Client("crawler_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, workers=10)
+        client = Client("crawler_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, workers=5)
         await client.start()
 
-        sem = asyncio.Semaphore(MAX_DOWNLOADS)
-
-        async def limited_process(post_url, index):
-            async with sem:
-                while state.paused and state.running:
-                    await asyncio.sleep(1)
-                if not state.running:
-                    return
-                
-                logger.info(f"[Task {index}/{state.total_posts}] Parsing payload info...")
-                info = await extract_video_info(session, post_url)
+        # Processing each video post sequentially ONE BY ONE
+        for idx, url in enumerate(all_posts, start=1):
+            # Check pause/stop conditions before each post iteration
+            while state.paused and state.running:
+                await asyncio.sleep(1)
+            if not state.running:
+                break
+            
+            logger.info(f"[Task {idx}/{state.total_posts}] Processing sequential payload info...")
+            
+            try:
+                # 1. Extract Details
+                info = await extract_video_info(session, url)
                 if not info or not info['post_id']:
-                    return
+                    state.processed += 1
+                    continue
+                    
+                # 2. Database Check
                 if await is_video_uploaded(info['post_id']):
                     logger.info(f"Skipping Post ID {info['post_id']} - already indexed in database.")
                     state.processed += 1
-                    return
+                    continue
                 
-                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                filename = os.path.join(DOWNLOAD_DIR, f"{info['post_id']}_{os.path.basename(info['video_url'])}")
-                
-                filepath = await download_video(session, info['video_url'], filename)
+                # 3. Download (Wait until finished)
+                filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
                 if not filepath:
-                    return
+                    state.processed += 1
+                    continue
                 
+                # 4. Upload (Wait until finished)
                 success = await upload_video(client, filepath, info)
                 if success:
                     await mark_uploaded(
@@ -449,18 +477,13 @@ async def crawl_and_process():
                         pass
                 else:
                     logger.warning(f"Upload failed for target {info['post_id']}. Media preserved.")
-                state.processed += 1
-
-        tasks = []
-        for idx, url in enumerate(all_posts, start=1):
-            if not state.running:
-                break
-            tasks.append(asyncio.create_task(limited_process(url, idx)))
-            while state.paused and state.running:
-                await asyncio.sleep(1)
-        
-        if tasks:
-            await asyncio.gather(*tasks)
+                
+            except Exception as e:
+                logger.error(f"Error handling post {url}: {e}")
+                
+            state.processed += 1
+            # Small cooldown step to prevent hammering local disk write I/O / Telegram API limits
+            await asyncio.sleep(1)
             
         await client.stop()
         logger.info("Crawler run successfully finished.")
@@ -568,12 +591,12 @@ async def single_cmd(client: Client, message: Message):
         if await is_video_uploaded(info['post_id']):
             await progress_msg.edit_text(f"ℹ️ Video already uploaded: {info['title']}")
             return
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        filename = os.path.join(DOWNLOAD_DIR, f"{info['post_id']}_{os.path.basename(info['video_url'])}")
-        filepath = await download_video(session, info['video_url'], filename)
+
+        filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
         if not filepath:
             await progress_msg.edit_text("❌ Download failed.")
             return
+            
         upload_client = Client("single_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
         await upload_client.start()
         success = await upload_video(upload_client, filepath, info)
@@ -672,7 +695,6 @@ async def main():
         await app.start()
         logger.info("Bot started successfully.")
 
-        # Validate channel
         try:
             chat = await app.get_chat(CHANNEL_ID)
             logger.info(f"Channel validated: {chat.title} (ID: {chat.id})")
@@ -680,7 +702,6 @@ async def main():
             logger.error(f"Failed to access channel: {e}")
             logger.error("Make sure CHANNEL_ID is correct and the bot is an admin.")
 
-        # Auto‑start if enabled
         if AUTO_START:
             logger.info("Auto‑start enabled. Starting crawler now...")
             state.task = asyncio.create_task(crawl_and_process())
