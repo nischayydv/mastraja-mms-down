@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MastiRaja Crawler – Telegram Bot Manager (Dynamic Page‑by‑Page Streamer)
-Controls: /starttask, /pause, /resume, /stop, /status, /logs, /history, /single, /ping, /help
+MastiRaja Crawler – Telegram Bot Manager (Slug-Based Live Channel Verification - No DB)
+Controls: /starttask, /pause, /resume, /stop, /status, /logs, /single, /ping, /help
 """
 
 import asyncio
@@ -21,10 +21,8 @@ except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-# ---------- Pyrogram Patches ----------
 import aiohttp
 import aiofiles
-import aiosqlite
 import yt_dlp
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -58,7 +56,6 @@ API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
-DB_FILE = os.getenv("DB_FILE", "videos.db")  
 LOG_FILE = os.getenv("LOG_FILE", "crawler.log")
 PORT = int(os.getenv("PORT", 8080))  
 AUTO_START = os.getenv("AUTO_START", "true").lower() == "true"
@@ -109,12 +106,20 @@ class CrawlerState:
 
 state = CrawlerState()
 
-# ---------- Helper to Clean Bad Entity Formats ----------
 def clean_for_tg(text: str) -> str:
-    """Removes or replaces characters that easily break Telegram markdown entities."""
-    if not text:
-        return ""
+    if not text: return ""
     return text.replace("*", "").replace("_", "").replace("`", "").replace("<", "[").replace(">", "]")
+
+def extract_slug_id(url: str) -> str:
+    """Extracts a unique alphanumeric slug string from text-based URLs to act as post_id"""
+    try:
+        parsed = urlparse(url)
+        slug = parsed.path.strip('/')
+        if '/' in slug:
+            slug = slug.split('/')[-1]
+        return slug if slug else "unknown_target"
+    except Exception:
+        return "unknown_target"
 
 # ---------- UI Progress Monitors ----------
 def make_progress_bar(percentage: float, length: int = 10) -> str:
@@ -127,7 +132,6 @@ def build_live_status_text() -> str:
     proc = state.processed
     overall_pct = (proc / total * 100) if total > 0 else 0.0
     overall_bar = make_progress_bar(overall_pct, length=12)
-    
     cleaned_title = clean_for_tg(state.current_title)
     
     text = (
@@ -138,11 +142,11 @@ def build_live_status_text() -> str:
     )
     
     if state.current_stage == "Scraping":
-        text += "🛰️ **Phase:** Reading page links from site index..."
-    elif state.current_stage in ["Extracting Info", "Downloading", "Uploading"]:
+        text += f"🛰️ **Phase:** Reading Page {state.current_page} links from site index..."
+    elif state.current_stage in ["Checking Channel", "Extracting Info", "Downloading", "Uploading"]:
         text += (
             f"📦 **Phase: Processing Media Pipeline**\n"
-            f"• Page Processing Queue: `{proc} / {total}` links handled\n"
+            f"• Page Queue: `{proc} / {total}` links handled\n"
             f"• Batch Ratio: `[{overall_bar}] {overall_pct:.1f}%`\n\n"
             f"🎬 **Active Task Target:**\n"
             f"• Title: `{cleaned_title[:55]}`\n"
@@ -155,7 +159,7 @@ def build_live_status_text() -> str:
             ul_bar = make_progress_bar(state.upload_pct, length=10)
             text += f"• **Data Output (Telegram UI):** `[{ul_bar}] {state.upload_pct:.1f}%`\n"
     elif state.current_stage == "Finished":
-        text += f"✅ **Run Finished!** Everything is updated up to page `{state.current_page}`."
+        text += f"✅ **Run Finished!** All pages synced perfectly up to page `{state.current_page}`."
     else:
         text += "💤 Engine standing by on sleep interval."
     return text
@@ -173,61 +177,20 @@ async def live_ui_refresh_loop(client: Client):
                     await asyncio.sleep(e.value + 1)
                 except Exception:
                     pass
-            else:
-                last_text = current_text
         await asyncio.sleep(3.5)
 
-# ---------- SQL Engine Backend ----------
-async def init_db():
-    os.makedirs(os.path.dirname(DB_FILE) or '.', exist_ok=True)
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS videos (
-                post_id INTEGER PRIMARY KEY,
-                title TEXT,
-                video_url TEXT,
-                file_path TEXT,
-                category TEXT,
-                tags TEXT,
-                duration TEXT,
-                views TEXT,
-                description TEXT,
-                uploaded INTEGER DEFAULT 0,
-                upload_date TEXT,
-                last_checked TEXT
-            )
-        ''')
-        await db.commit()
-
-async def is_video_uploaded(post_id: int) -> bool:
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT 1 FROM videos WHERE post_id = ? AND uploaded = 1", (post_id,)) as cur:
-            row = await cur.fetchone()
-            return row is not None
-
-async def mark_uploaded(post_id, file_path, title, video_url, category, tags, duration, views, description):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('''
-            INSERT OR REPLACE INTO videos
-            (post_id, title, video_url, file_path, category, tags, duration, views, description, uploaded, upload_date, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
-        ''', (post_id, title, video_url, file_path, category, tags, duration, views, description))
-        await db.commit()
-
-async def get_all_uploaded(limit: int = 20, offset: int = 0) -> List[Dict]:
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT post_id, title, category, duration, upload_date FROM videos WHERE uploaded=1 ORDER BY upload_date DESC LIMIT ? OFFSET ?",
-            (limit, offset)
-        ) as cur:
-            rows = await cur.fetchall()
-            return [{"post_id": r[0], "title": r[1], "category": r[2], "duration": r[3], "upload_date": r[4]} for r in rows]
-
-async def get_total_uploaded_count() -> int:
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT COUNT(*) FROM videos WHERE uploaded=1") as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+# ---------- Pure Channel Verifier (Slug Mode) ----------
+async def is_video_uploaded(client: Client, post_id: str) -> bool:
+    """Performs a live look up inside the Telegram Channel directly using the text slug ID string."""
+    try:
+        search_query = f"🆔 ID: {post_id}"
+        async for msg in client.search_messages(chat_id=CHANNEL_ID, query=search_query, limit=1):
+            if msg:
+                logger.info(f"🎯 Target Slug [{post_id}] found inside channel messages. Skipping download.")
+                return True
+    except Exception as e:
+        logger.error(f"Failed to execute Live Channel Search for Slug ID {post_id}: {e}")
+    return False
 
 # ---------- Extraction Architecture ----------
 async def fetch_soup(session: aiohttp.ClientSession, url: str):
@@ -266,8 +229,7 @@ def get_highest_quality_source(decoded_html: str) -> Optional[str]:
     best_quality = -1
     for src_tag in sources:
         src = src_tag.get('src')
-        if not src:
-            continue
+        if not src: continue
         quality = None
         for attr in ['quality', 'data-quality', 'bitrate', 'res']:
             val = src_tag.get(attr)
@@ -277,14 +239,11 @@ def get_highest_quality_source(decoded_html: str) -> Optional[str]:
                     if num:
                         quality = int(num.group(1))
                         break
-                except:
-                    pass
+                except: pass
         if quality is None:
             m = re.search(r'(\d+)p', src)
-            if m:
-                quality = int(m.group(1))
-            else:
-                quality = 0
+            if m: quality = int(m.group(1))
+            else: quality = 0
         if quality > best_quality:
             best_quality = quality
             best = src
@@ -292,12 +251,9 @@ def get_highest_quality_source(decoded_html: str) -> Optional[str]:
 
 async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> Optional[Dict]:
     soup = await fetch_soup(session, post_url)
-    if not soup:
-        return None
-    post_id = None
-    m = re.search(r'/(\d+)/?$', post_url)
-    if m:
-        post_id = int(m.group(1))
+    if not soup: return None
+    
+    post_id = extract_slug_id(post_url)
     title_tag = soup.find('h1', itemprop='name')
     title = title_tag.get_text(strip=True) if title_tag else "Untitled"
     iframe = soup.find('iframe', src=True)
@@ -319,42 +275,30 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
             video_url = video_tag.get('src')
             if not video_url:
                 source = video_tag.find('source')
-                if source:
-                    video_url = source.get('src')
-    if not video_url:
-        return None
+                if source: video_url = source.get('src')
+    if not video_url: return None
     cat_tag = soup.find('a', class_='label', title=True)
     category = cat_tag.get_text(strip=True) if cat_tag else "Uncategorized"
-    tags = []
-    for t in soup.find_all('a', class_='label'):
-        if 'fa-tag' in str(t) or '/tag/' in t.get('href', ''):
-            tags.append(t.get_text(strip=True))
+    tags = [t.get_text(strip=True) for t in soup.find_all('a', class_='label') if 'fa-tag' in str(t) or '/tag/' in t.get('href', '')]
     tags_str = ', '.join(tags)
     dur = soup.find('span', class_='duration')
     duration = dur.get_text(strip=True) if dur else ''
     views_span = soup.find('span', class_='views')
     views = views_span.get_text(strip=True).replace('i', '').strip() if views_span else ''
     desc_div = soup.find('div', class_='video-description')
-    desc = ''
-    if desc_div:
-        p = desc_div.find('p')
-        if p:
-            desc = p.get_text(strip=True)
+    desc = desc_div.find('p').get_text(strip=True) if (desc_div and desc_div.find('p')) else ''
+    
     return {
-        'post_id': post_id,
-        'title': title,
-        'video_url': video_url,
-        'category': category,
-        'tags': tags_str,
-        'duration': duration,
-        'views': views,
-        'description': desc,
+        'post_id': post_id, 'title': title, 'video_url': video_url, 'category': category,
+        'tags': tags_str, 'duration': duration, 'views': views, 'description': desc,
     }
 
 # ---------- Core Downloader ----------
-async def download_video(post_id: int, video_url: str, download_dir: str) -> Optional[str]:
+async def download_video(post_id: str, video_url: str, download_dir: str) -> Optional[str]:
     os.makedirs(download_dir, exist_ok=True)
-    outtmpl = os.path.join(download_dir, f"{post_id}_%(title)s.%(ext)s")
+    # Sanitize slug safely for system filenames
+    safe_post_id = re.sub(r'[^a-zA-Z0-9_-]', '', post_id)[:50]
+    outtmpl = os.path.join(download_dir, f"{safe_post_id}_%(title)s.%(ext)s")
     downloaded_file = None
 
     def progress_hook(d):
@@ -369,64 +313,53 @@ async def download_video(post_id: int, video_url: str, download_dir: str) -> Opt
                 state.download_pct = (downloaded / total) * 100
 
     ydl_opts = {
-        'outtmpl': outtmpl,
-        'quiet': True,
-        'no_warnings': True,
+        'outtmpl': outtmpl, 'quiet': True, 'no_warnings': True,
         'progress_hooks': [progress_hook],
         'http_headers': {'User-Agent': USER_AGENT, 'Referer': BASE_URL}
     }
 
     try:
         await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(ydl_opts).download([video_url]))
-        if downloaded_file and os.path.exists(downloaded_file):
-            return downloaded_file
+        if downloaded_file and os.path.exists(downloaded_file): return downloaded_file
         for file in os.listdir(download_dir):
-            if file.startswith(f"{post_id}_"):
-                return os.path.join(download_dir, file)
+            if file.startswith(f"{safe_post_id}_"): return os.path.join(download_dir, file)
     except Exception as e:
         logger.error(f"yt-dlp Core Error: {e}")
     return None
 
 async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
-    # Strings sanitized to protect entity bounds stability
     clean_title = clean_for_tg(info['title'])
     clean_cat = clean_for_tg(info['category'])
     clean_tags = clean_for_tg(info['tags'])
     clean_dur = clean_for_tg(info['duration'])
     clean_desc = clean_for_tg(info['description'])
 
+    # Anchor Tracking Line using the full Slug String
     caption = f"📹 Title: {clean_title}\n"
+    caption += f"🆔 ID: {info['post_id']}\n"
     if clean_cat: caption += f"📂 Category: {clean_cat}\n"
     if clean_tags: caption += f"🏷️ Tags: {clean_tags}\n"
     if clean_dur: caption += f"⏱️ Duration: {clean_dur}\n"
-    if clean_desc:
-        caption += f"📝 {clean_desc[:200]}...\n"
+    if clean_desc: caption += f"📝 {clean_desc[:200]}...\n"
     caption += f"\nUploaded by @NY_BOTS"
     
     try:
         def upload_progress(current, total):
-            if total > 0:
-                state.upload_pct = (current / total) * 100
+            if total > 0: state.upload_pct = (current / total) * 100
 
         await client.send_video(
-            chat_id=CHANNEL_ID,
-            video=filepath,
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
-            supports_streaming=True,
-            progress=upload_progress
+            chat_id=CHANNEL_ID, video=filepath, caption=caption,
+            parse_mode=ParseMode.MARKDOWN, supports_streaming=True, progress=upload_progress
         )
         return True
     except RPCError as e:
         logger.error(f"Telegram Upload Error: {e}")
         return False
 
-# ---------- One-by-One Pipeline Engine ----------
+# ---------- Dynamic Verification Pipeline Engine ----------
 async def crawl_and_process(bot_client: Client):
     async with state.lock:
-        if state.running:
-            logger.info("Crawler is already running.")
-            return
+        if state.running: return
         state.running = True
         state.paused = False
         state.status = "running"
@@ -437,39 +370,36 @@ async def crawl_and_process(bot_client: Client):
         state.current_page = 1
         
         while state.current_page <= MAX_PAGES_TO_SCAN and state.running:
-            while state.paused and state.running:
-                await asyncio.sleep(1)
-            if not state.running:
-                break
+            while state.paused and state.running: await asyncio.sleep(1)
+            if not state.running: break
                 
             url = BASE_URL if state.current_page == 1 else f"{BASE_URL}/page/{state.current_page}/"
             logger.info(f"Scanning target index feed page {state.current_page}...")
             state.current_stage = "Scraping"
             
             soup = await fetch_soup(session, url)
-            if not soup:
-                break
+            if not soup: break
                 
             links = extract_post_links(soup)
-            if not links:
-                break
+            if not links: break
                 
             state.total_posts = len(links)
             state.processed = 0
             page_had_new_video = False
             
-            # Strict serialization layout loop
+            # Pure One-by-One Pipeline Layout
             for target_url in links:
-                while state.paused and state.running:
-                    await asyncio.sleep(1)
-                if not state.running:
-                    break
+                while state.paused and state.running: await asyncio.sleep(1)
+                if not state.running: break
                     
-                m = re.search(r'/(\d+)/?$', target_url)
-                if m:
-                    post_id = int(m.group(1))
-                    if await is_video_uploaded(post_id):
-                        logger.info(f"[Page {state.current_page}] Video {post_id} already exists in DB. Skipping.")
+                slug_id = extract_slug_id(target_url)
+                if slug_id:
+                    state.current_stage = "Checking Channel"
+                    state.current_title = f"Checking target ID: {slug_id}"
+                    
+                    # Search using text slug tracking key layout
+                    if await is_video_uploaded(bot_client, slug_id):
+                        logger.info(f"[Page {state.current_page}] Slug [{slug_id}] already exists on channel. Skipping.")
                         state.processed += 1
                         continue 
                 
@@ -486,34 +416,27 @@ async def crawl_and_process(bot_client: Client):
                 state.download_pct = 0.0
                 state.upload_pct = 0.0
                 
-                # Step 1: Sequential Download Execution
+                # Step 1: Download first
                 state.current_stage = "Downloading"
-                logger.info(f"Downloading Target [{info['post_id']}]: {info['title']}")
+                logger.info(f"Downloading Target Slug [{info['post_id']}]: {info['title']}")
                 filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
                 if not filepath:
                     state.processed += 1
                     continue
                     
-                # Step 2: Sequential Upload Execution
+                # Step 2: Upload before proceeding
                 state.current_stage = "Uploading"
                 logger.info(f"Uploading Target directly to channel: {info['title']}")
                 success = await upload_video(bot_client, filepath, info)
                 if success:
-                    await mark_uploaded(
-                        info['post_id'], filepath, info['title'], info['video_url'],
-                        info['category'], info['tags'], info['duration'],
-                        info['views'], info['description']
-                    )
-                    try:
-                        os.remove(filepath)
-                    except Exception:
-                        pass
+                    try: os.remove(filepath)
+                    except Exception: pass
                 
                 state.processed += 1
                 await asyncio.sleep(2) 
             
             if not page_had_new_video:
-                logger.info(f"Page {state.current_page} contained only historical items. System caught up.")
+                logger.info(f"Page {state.current_page} matches live channel logs perfectly. Channel caught up.")
                 break
                 
             state.current_page += 1
@@ -529,7 +452,7 @@ async def start_task_cmd(client: Client, message: Message):
     if state.running:
         await message.reply("⚠️ Crawler is already running.")
         return
-    state.status_msg = await message.reply("🚀 **Initializing Engine Progress Tracker Layout...**")
+    state.status_msg = await message.reply("🚀 **Initializing Slug-Based Live Tracker Layout...**")
     state.task = asyncio.create_task(crawl_and_process(client))
 
 async def pause_cmd(client: Client, message: Message):
@@ -550,13 +473,16 @@ async def stop_cmd(client: Client, message: Message):
     state.paused = False
     state.status = "stopped"
     state.current_stage = "Idle"
-    if state.task and not state.task.done():
-        state.task.cancel()
+    if state.task and not state.task.done(): state.task.cancel()
     await message.reply("⏹ Crawler stopped.")
 
 async def status_cmd(client: Client, message: Message):
-    uploaded = await get_total_uploaded_count()
-    await message.reply(f"📊 Engine Status\n• State: {state.status}\n• Total Synced Records: {uploaded}")
+    await message.reply(
+        f"📊 **Engine Status (Slug Mode)**\n"
+        f"• State: `{state.status.upper()}`\n"
+        f"• Current Page: `{state.current_page}`\n"
+        f"• Processing Page Feed: `{state.processed}/{state.total_posts}`"
+    )
 
 async def logs_cmd(client: Client, message: Message):
     try:
@@ -569,19 +495,9 @@ async def logs_cmd(client: Client, message: Message):
             if len(txt) > 4000:
                 await message.reply_document(document=LOG_FILE, caption="📄 System Logs")
             else:
-                await message.reply(f"📄 Logs (Last 200 Lines):\n```\n{txt}```")
+                await message.reply(f"📄 Logs:\n```\n{txt}```")
     except Exception as e:
         await message.reply(f"❌ Error compiling logs: {e}")
-
-async def history_cmd(client: Client, message: Message):
-    rows = await get_all_uploaded(limit=20, offset=0)
-    if not rows:
-        await message.reply("📭 History is empty.")
-        return
-    text = "📜 Last 20 Uploaded Updates:\n\n"
-    for row in rows:
-        text += f"• {row['title'][:50]} | {row['category']}\n"
-    await message.reply(text)
 
 async def single_cmd(client: Client, message: Message):
     args = message.text.split(maxsplit=1)
@@ -589,16 +505,17 @@ async def single_cmd(client: Client, message: Message):
         await message.reply("❌ Usage: /single URL")
         return
     url = args[1].strip()
-    progress_msg = await message.reply("⏳ Initializing single execution task...")
+    progress_msg = await message.reply("⏳ Initializing single verification task...")
     async with aiohttp.ClientSession() as session:
         info = await extract_video_info(session, url)
-        if not info or await is_video_uploaded(info['post_id']):
-            await progress_msg.edit_text("❌ Action cancelled. Video is already indexed or invalid.")
+        if not info:
+            await progress_msg.edit_text("❌ Action cancelled. Invalid video structure.")
+            return
+        if await is_video_uploaded(client, info['post_id']):
+            await progress_msg.edit_text("❌ Action cancelled. Slug already matches content on channel.")
             return
         filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
         if filepath and await upload_video(client, filepath, info):
-            await mark_uploaded(info['post_id'], filepath, info['title'], info['video_url'],
-                                info['category'], info['tags'], info['duration'], info['views'], info['description'])
             try: os.remove(filepath)
             except Exception: pass
             await progress_msg.edit_text(f"✅ Uploaded: {info['title']}")
@@ -606,20 +523,19 @@ async def single_cmd(client: Client, message: Message):
             await progress_msg.edit_text("❌ Single processing pipeline failed.")
 
 async def ping_cmd(client: Client, message: Message):
-    await message.reply("🏓 Pong! Core runtime is up and online.")
+    await message.reply("🏓 Pong! Core engine runtime is online.")
 
 async def help_cmd(client: Client, message: Message):
     text = (
-        "🤖 MastiRaja Flow Controller\n\n"
-        "/starttask - Launch real-time updater monitoring\n"
-        "/pause - Freeze active transfers\n"
-        "/resume - Unfreeze active transfers\n"
-        "/stop - Hard-terminate processing jobs\n"
-        "/status - Total index stats snapshot\n"
-        "/logs - Check runtime error readouts\n"
-        "/history - View recently deployed channel packages\n"
-        "/single URL - Target process an isolated URL asset\n"
-        "/ping - Verify engine connectivity"
+        "🤖 MastiRaja Smart Sync Controller (Slug Track Mode)\n\n"
+        "/starttask - Launch live-tracker interface\n"
+        "/pause - Freeze transfers\n"
+        "/resume - Unfreeze transfers\n"
+        "/stop - Terminate tracking operations\n"
+        "/status - View current live tracking progress\n"
+        "/logs - Check system console outputs\n"
+        "/single URL - Process isolated custom asset URL\n"
+        "/ping - Verify active server response"
     )
     await message.reply(text)
 
@@ -633,22 +549,17 @@ async def http_server():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, host='0.0.0.0', port=PORT).start()
-    logger.info(f"HTTP Server health checkpoint bind success to port {PORT}")
+    logger.info(f"HTTP Server health check working fine on port {PORT}")
     await asyncio.Event().wait()
 
 # ---------- Program Main Loop ----------
 async def main():
-    await init_db()
-    # Fixed: Retained core server background context frame mapping inside state
     state.http_task = asyncio.create_task(http_server())
 
     app = Client(
         "mastiraja_bot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        in_memory=True,
-        workers=20
+        api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+        in_memory=True, workers=20
     )
 
     @app.on_message()
@@ -661,7 +572,6 @@ async def main():
         elif cmd == '/stop': await stop_cmd(client, message)
         elif cmd == '/status': await status_cmd(client, message)
         elif cmd == '/logs': await logs_cmd(client, message)
-        elif cmd == '/history': await history_cmd(client, message)
         elif cmd.startswith('/single'): await single_cmd(client, message)
         elif cmd == '/ping': await ping_cmd(client, message)
         elif cmd == '/help': await help_cmd(client, message)
@@ -669,10 +579,10 @@ async def main():
     try:
         logger.info("Starting bot...")
         await app.start()
-        logger.info("Bot started successfully.")
+        logger.info("Bot started successfully in Pure Channel Tracking Slug mode.")
 
         if AUTO_START:
-            logger.info("Auto‑start flag is true. Invoking sequential processing daemon...")
+            logger.info("Auto‑start flag is true. Invoking processing daemon...")
             state.task = asyncio.create_task(crawl_and_process(app))
 
         await asyncio.Event().wait()
