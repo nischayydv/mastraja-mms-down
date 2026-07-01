@@ -22,15 +22,12 @@ except RuntimeError:
     asyncio.set_event_loop(loop)
 
 # ---------- FIX 2: Patch Pyrogram's Identifier ----------
-# We import pyrogram types after patching
-
 import aiohttp
 import aiofiles
 import aiosqlite
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-# ---------- Pyrogram imports ----------
 from pyrogram import Client
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -38,7 +35,6 @@ from pyrogram.types import (
 from pyrogram.errors import RPCError
 from pyrogram.enums import ParseMode
 
-# Apply patch before using pyrogram client
 from pyrogram.types.pyromod import Identifier
 if not hasattr(Identifier, '__annotations__'):
     Identifier.__annotations__ = {}
@@ -90,7 +86,7 @@ class CrawlerState:
         self.lock = asyncio.Lock()
         self.waiting_for_single = False
 
-state = CrawlerState()
+state = CrawlerState()   # <-- global variable
 
 # ---------- Database ----------
 async def init_db():
@@ -384,8 +380,9 @@ async def crawl_and_process():
         logger.info("Pyrogram upload client started.")
 
         sem = asyncio.Semaphore(MAX_DOWNLOADS)
+
         async def limited_process(post_url):
-            nonlocal state
+            # No 'nonlocal state' – state is global
             async with sem:
                 while state.paused and state.running:
                     await asyncio.sleep(1)
@@ -408,11 +405,13 @@ async def crawl_and_process():
                         info['category'], info['tags'], info['duration'],
                         info['views'], info['description']
                     )
-                    try: os.remove(filepath)
-                    except: pass
+                    try:
+                        os.remove(filepath)
+                    except:
+                        pass
                 else:
                     logger.warning(f"Upload failed for post {info['post_id']}, file kept.")
-                state.processed += 1
+                state.processed += 1   # directly mutate global state
 
         tasks = []
         for url in all_posts:
@@ -517,8 +516,10 @@ async def stop_crawler_cb(client: Client, callback: CallbackQuery):
     state.status = "stopped"
     if state.task and not state.task.done():
         state.task.cancel()
-        try: await state.task
-        except: pass
+        try:
+            await state.task
+        except:
+            pass
     await callback.answer("Stopped.", show_alert=True)
     await callback.message.edit_text("⏹ Stopped.", reply_markup=get_main_menu())
 
@@ -615,8 +616,10 @@ async def handle_single_url(client: Client, message: Message):
             await mark_uploaded(info['post_id'], filepath, info['title'], info['video_url'],
                                 info['category'], info['tags'], info['duration'],
                                 info['views'], info['description'])
-            try: os.remove(filepath)
-            except: pass
+            try:
+                os.remove(filepath)
+            except:
+                pass
             await progress.edit_text(f"✅ Uploaded: {info['title']}")
         else:
             await progress.edit_text("❌ Upload failed.")
@@ -633,7 +636,6 @@ async def menu_cb(client: Client, callback: CallbackQuery):
 
 # ---------- HTTP Health Check Server ----------
 async def http_server():
-    """Simple HTTP server for Render health checks."""
     from aiohttp import web
     app = web.Application()
     async def health(request):
@@ -645,16 +647,13 @@ async def http_server():
     site = web.TCPSite(runner, host='0.0.0.0', port=PORT)
     await site.start()
     logger.info(f"HTTP health server running on port {PORT}")
-    # Keep running
     await asyncio.Event().wait()
 
 # ---------- Main ----------
 async def main():
     await init_db()
-    # Start HTTP server in background
     asyncio.create_task(http_server())
 
-    # Start bot
     app = Client(
         "mastiraja_bot",
         api_id=API_ID,
@@ -676,38 +675,64 @@ async def main():
             if cmd == '/start':
                 await start_cmd(client, message)
             elif cmd == '/pause':
-                if not state.running: await message.reply("Not running.")
-                elif state.paused: await message.reply("Already paused.")
-                else: state.paused = True; state.status = "paused"; await message.reply("⏸ Paused.")
+                if not state.running:
+                    await message.reply("Not running.")
+                elif state.paused:
+                    await message.reply("Already paused.")
+                else:
+                    state.paused = True
+                    state.status = "paused"
+                    await message.reply("⏸ Paused.")
             elif cmd == '/resume':
-                if not state.running: await message.reply("Not running.")
-                elif not state.paused: await message.reply("Not paused.")
-                else: state.paused = False; state.status = "running"; await message.reply("▶️ Resumed.")
+                if not state.running:
+                    await message.reply("Not running.")
+                elif not state.paused:
+                    await message.reply("Not paused.")
+                else:
+                    state.paused = False
+                    state.status = "running"
+                    await message.reply("▶️ Resumed.")
             elif cmd == '/stop':
-                if not state.running: await message.reply("Not running.")
-                else: state.running = False; state.paused = False; state.status = "stopped"; await message.reply("⏹ Stopped.")
+                if not state.running:
+                    await message.reply("Not running.")
+                else:
+                    state.running = False
+                    state.paused = False
+                    state.status = "stopped"
+                    await message.reply("⏹ Stopped.")
             elif cmd == '/status':
-                pending = await get_pending_count(); uploaded = await get_total_uploaded_count()
-                await message.reply(f"📊 *Status*\n• State: `{state.status}`\n• Total: {state.total_posts}\n• Processed: {state.processed}\n• Pending DB: {pending}\n• Uploaded: {uploaded}", parse_mode=ParseMode.MARKDOWN)
+                pending = await get_pending_count()
+                uploaded = await get_total_uploaded_count()
+                await message.reply(
+                    f"📊 *Status*\n• State: `{state.status}`\n• Total: {state.total_posts}\n• Processed: {state.processed}\n• Pending DB: {pending}\n• Uploaded: {uploaded}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
             elif cmd == '/logs':
                 try:
                     with open(LOG_FILE, 'r') as f:
-                        lines = f.readlines(); tail = lines[-200:] if len(lines)>200 else lines
+                        lines = f.readlines()
+                        tail = lines[-200:] if len(lines) > 200 else lines
                         if tail:
-                            txt=''.join(tail)
-                            if len(txt)>4000: await message.reply_document(document=LOG_FILE, caption="Logs")
-                            else: await message.reply(f"📄 *Logs*\n```\n{txt}```", parse_mode=ParseMode.MARKDOWN)
-                        else: await message.reply("No logs.")
-                except: await message.reply("Error reading logs.")
+                            txt = ''.join(tail)
+                            if len(txt) > 4000:
+                                await message.reply_document(document=LOG_FILE, caption="Logs")
+                            else:
+                                await message.reply(f"📄 *Logs*\n```\n{txt}```", parse_mode=ParseMode.MARKDOWN)
+                        else:
+                            await message.reply("No logs.")
+                except:
+                    await message.reply("Error reading logs.")
             elif cmd == '/history':
                 rows = await get_all_uploaded(limit=10, offset=0)
                 total = await get_total_uploaded_count()
-                total_pages = (total+9)//10 if total>0 else 1
+                total_pages = (total + 9) // 10 if total > 0 else 1
                 if rows:
                     text = f"📜 *History (1/{total_pages})*\n\n"
-                    for r in rows: text += f"• {r['title'][:50]} | {r['category']}\n"
-                    await message.reply(text, reply_markup=get_history_pagination(1,total_pages), parse_mode=ParseMode.MARKDOWN)
-                else: await message.reply("No uploaded videos.")
+                    for r in rows:
+                        text += f"• {r['title'][:50]} | {r['category']}\n"
+                    await message.reply(text, reply_markup=get_history_pagination(1, total_pages), parse_mode=ParseMode.MARKDOWN)
+                else:
+                    await message.reply("No uploaded videos.")
             elif cmd == '/single':
                 state.waiting_for_single = True
                 await message.reply("Send the URL:", reply_markup=get_single_cancel())
@@ -721,19 +746,29 @@ async def main():
     @app.on_callback_query()
     async def handle_cb(client, callback):
         data = callback.data
-        if data == "start": await start_crawler_cb(client, callback)
-        elif data == "pause": await pause_crawler_cb(client, callback)
-        elif data == "resume": await resume_crawler_cb(client, callback)
-        elif data == "stop": await stop_crawler_cb(client, callback)
-        elif data == "status": await status_cb(client, callback)
-        elif data == "logs": await logs_cb(client, callback)
-        elif data == "history": await history_cb(client, callback, page=1)
-        elif data == "single": await single_prompt_cb(client, callback)
-        elif data == "help": await help_cb(client, callback)
-        elif data == "menu": await menu_cb(client, callback)
+        if data == "start":
+            await start_crawler_cb(client, callback)
+        elif data == "pause":
+            await pause_crawler_cb(client, callback)
+        elif data == "resume":
+            await resume_crawler_cb(client, callback)
+        elif data == "stop":
+            await stop_crawler_cb(client, callback)
+        elif data == "status":
+            await status_cb(client, callback)
+        elif data == "logs":
+            await logs_cb(client, callback)
+        elif data == "history":
+            await history_cb(client, callback, page=1)
+        elif data == "single":
+            await single_prompt_cb(client, callback)
+        elif data == "help":
+            await help_cb(client, callback)
+        elif data == "menu":
+            await menu_cb(client, callback)
         elif data.startswith("history_"):
             parts = data.split("_")
-            if len(parts)==2 and parts[1].isdigit():
+            if len(parts) == 2 and parts[1].isdigit():
                 await history_cb(client, callback, page=int(parts[1]))
             else:
                 await callback.answer("Invalid page.")
