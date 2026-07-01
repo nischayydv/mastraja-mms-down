@@ -17,8 +17,8 @@ import logging
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
-from pyroblack import Client
-from pyroblack.errors import RPCError
+from pyrogram import Client
+from pyrogram.errors import RPCError
 
 # ========= CONFIG from environment ==========
 BASE_URL = "https://mastiraja.com"
