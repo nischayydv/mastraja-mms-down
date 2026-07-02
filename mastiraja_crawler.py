@@ -499,7 +499,34 @@ class SiteHttpClient:
             return None
         return BeautifulSoup(html, "html.parser")
 
-HTTP = SiteHttpClient()
+HTTP = None
+class SiteHttpClient:
+    def __init__(self):
+        self.connector = None
+        self.session = None
+
+    async def start(self):
+        self.connector = TCPConnector(
+            limit=CFG.CONNECTOR_LIMIT,
+            limit_per_host=CFG.CONNECTOR_LIMIT_PER_HOST,
+            ssl=False
+        )
+        timeout = ClientTimeout(
+            total=CFG.REQUEST_TIMEOUT,
+            connect=CFG.CONNECT_TIMEOUT,
+            sock_read=CFG.SOCK_READ_TIMEOUT
+        )
+        self.session = aiohttp.ClientSession(
+            connector=self.connector,
+            timeout=timeout,
+            headers={"User-Agent": CFG.USER_AGENT}
+        )
+
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+        self.session = None
+        self.connector = None
 
 # =========================================================
 # SCRAPER
@@ -1288,19 +1315,31 @@ def setup_signal_handlers():
 # MAIN
 # =========================================================
 
+HTTP = None
+
 async def main():
-    CFG.validate()
-    setup_signal_handlers()
+    global HTTP
+    HTTP = SiteHttpClient()
+    await HTTP.start()
 
-    await start_http_server()
+    try:
+        asyncio.create_task(http_server())
 
-    app = Client(
-        "mastiraja_userbot_ultra",
-        api_id=CFG.API_ID,
-        api_hash=CFG.API_HASH,
-        session_string=CFG.STRING_SESSION,
-        in_memory=True
-    )
+        app = Client(
+            "mastiraja_userbot",
+            api_id=CFG.API_ID,
+            api_hash=CFG.API_HASH,
+            session_string=CFG.STRING_SESSION,
+            in_memory=True
+        )
+
+        await app.start()
+        logger.info("Bot started.")
+        await asyncio.Event().wait()
+
+    finally:
+        if HTTP:
+            await HTTP.close()
 
     @app.on_message(filters.me & filters.command([
         "starttask", "pause", "resume", "stop", "status",
