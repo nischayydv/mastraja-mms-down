@@ -445,12 +445,6 @@ async def autosave_loop():
         STORE.save_processed()
         await asyncio.sleep(10)
 
-async def send_status_panel(message: Message):
-    STATE.status_msg = await message.reply(
-        build_status_text(),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
 # =========================================================
 # HTTP CLIENT (site scraping client — single, merged definition)
 # =========================================================
@@ -799,7 +793,7 @@ async def upload_video(client: Client, media_info: Dict[str, Any], info: Dict[st
     thumb_to_pass = prepare_telegram_thumb(thumb_path)
     caption = build_caption(info)
 
-    def progress(current, total):
+    async def progress(current, total):
         if total > 0:
             STATE.current_upload_bytes = int(current)
             STATE.upload_pct = (current / total) * 100
@@ -1076,12 +1070,6 @@ async def crawl_and_process(client: Client):
 # COMMANDS
 # =========================================================
 
-async def send_status_panel(message: Message):
-    STATE.status_msg = await message.reply(
-        build_status_text(),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
 async def cmd_starttask(client: Client, message: Message):
     if STATE.running:
         await message.reply("⚠️ **Crawler already running.**", parse_mode=ParseMode.MARKDOWN)
@@ -1096,18 +1084,12 @@ async def cmd_starttask(client: Client, message: Message):
 
     STORE.set_setting("last_start_page", STATE.current_page)
 
-    STATE.status = "running"
-    STATE.current_stage = "Initializing"
-    STATE.current_title = f"Page {STATE.current_page}"
-    STATE.current_slug = "-"
-    STATE.current_url = "-"
-    STATE.current_error = "None"
-    STATE.download_pct = 0.0
-    STATE.upload_pct = 0.0
-    STATE.current_downloaded_bytes = 0
-    STATE.current_upload_bytes = 0
+    STATE.status_msg = await message.reply(
+        f"🚀 **Ultra crawler initialized from page {STATE.current_page}.**\n"
+        f"`/pause` `/resume` `/status` `/stats` `/stop` `/help`",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-    await send_status_panel(message)
     STATE.worker_task = asyncio.create_task(crawl_and_process(client))
 
 async def cmd_stop(client: Client, message: Message):
@@ -1188,7 +1170,6 @@ async def cmd_setpage(client: Client, message: Message):
     if len(args) < 2 or not args[1].isdigit():
         await message.reply("Usage: `/setpage 4`", parse_mode=ParseMode.MARKDOWN)
         return
-
     if STATE.running or STATE.paused:
         await message.reply("⚠️ Stop crawler before changing page.", parse_mode=ParseMode.MARKDOWN)
         return
@@ -1234,7 +1215,6 @@ async def cmd_help(client: Client, message: Message):
         f"• `/help` - Show this help"
     )
     await message.reply(txt, parse_mode=ParseMode.MARKDOWN)
-
 
 # =========================================================
 # HTTP SERVER (keep-alive / health endpoint for Render)
