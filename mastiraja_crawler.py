@@ -446,7 +446,7 @@ async def autosave_loop():
         await asyncio.sleep(10)
 
 # =========================================================
-# HTTP CLIENT
+# HTTP CLIENT (site scraping client — single, merged definition)
 # =========================================================
 
 class SiteHttpClient:
@@ -456,15 +456,16 @@ class SiteHttpClient:
             connect=CFG.CONNECT_TIMEOUT,
             sock_read=CFG.SOCK_READ_TIMEOUT
         )
-        self.connector = TCPConnector(
-            limit=CFG.CONNECTOR_LIMIT,
-            limit_per_host=CFG.CONNECTOR_LIMIT_PER_HOST,
-            ssl=False
-        )
+        self.connector: Optional[TCPConnector] = None
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
         if self.session is None or self.session.closed:
+            self.connector = TCPConnector(
+                limit=CFG.CONNECTOR_LIMIT,
+                limit_per_host=CFG.CONNECTOR_LIMIT_PER_HOST,
+                ssl=False
+            )
             self.session = aiohttp.ClientSession(
                 timeout=self.timeout,
                 connector=self.connector,
@@ -474,6 +475,8 @@ class SiteHttpClient:
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
+        self.session = None
+        self.connector = None
 
     async def fetch_text(self, url: str) -> Optional[str]:
         await self.start()
@@ -499,34 +502,7 @@ class SiteHttpClient:
             return None
         return BeautifulSoup(html, "html.parser")
 
-HTTP = None
-class SiteHttpClient:
-    def __init__(self):
-        self.connector = None
-        self.session = None
-
-    async def start(self):
-        self.connector = TCPConnector(
-            limit=CFG.CONNECTOR_LIMIT,
-            limit_per_host=CFG.CONNECTOR_LIMIT_PER_HOST,
-            ssl=False
-        )
-        timeout = ClientTimeout(
-            total=CFG.REQUEST_TIMEOUT,
-            connect=CFG.CONNECT_TIMEOUT,
-            sock_read=CFG.SOCK_READ_TIMEOUT
-        )
-        self.session = aiohttp.ClientSession(
-            connector=self.connector,
-            timeout=timeout,
-            headers={"User-Agent": CFG.USER_AGENT}
-        )
-
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-        self.session = None
-        self.connector = None
+HTTP: Optional[SiteHttpClient] = None
 
 # =========================================================
 # SCRAPER
@@ -1086,7 +1062,6 @@ async def crawl_and_process(client: Client):
         STORE.save_failed()
         STORE.save_runtime(STATE.to_runtime_dict())
         cleanup_tmp_dir()
-        await HTTP.close()
 
         if STATE.ui_task:
             STATE.ui_task.cancel()
@@ -1244,7 +1219,7 @@ async def cmd_help(client: Client, message: Message):
     await message.reply(txt, parse_mode=ParseMode.MARKDOWN)
 
 # =========================================================
-# HTTP SERVER
+# HTTP SERVER (keep-alive / health endpoint for Render)
 # =========================================================
 
 async def start_http_server():
@@ -1315,31 +1290,21 @@ def setup_signal_handlers():
 # MAIN
 # =========================================================
 
-HTTP = None
-
 async def main():
     global HTTP
+
+    CFG.validate()
+
     HTTP = SiteHttpClient()
     await HTTP.start()
 
-    try:
-        asyncio.create_task(http_server())
-
-        app = Client(
-            "mastiraja_userbot",
-            api_id=CFG.API_ID,
-            api_hash=CFG.API_HASH,
-            session_string=CFG.STRING_SESSION,
-            in_memory=True
-        )
-
-        await app.start()
-        logger.info("Bot started.")
-        await asyncio.Event().wait()
-
-    finally:
-        if HTTP:
-            await HTTP.close()
+    app = Client(
+        "mastiraja_userbot",
+        api_id=CFG.API_ID,
+        api_hash=CFG.API_HASH,
+        session_string=CFG.STRING_SESSION,
+        in_memory=True
+    )
 
     @app.on_message(filters.me & filters.command([
         "starttask", "pause", "resume", "stop", "status",
@@ -1372,16 +1337,30 @@ async def main():
         elif cmd == "/help":
             await cmd_help(client, message)
 
-    await app.start()
-    logger.info("✨ Ultra userbot online. Use /help")
-    logger.info(f"Target channel: {CFG.channel_id()}")
+    try:
+        # Keep-alive HTTP server (required by Render web services)
+        asyncio.create_task(start_http_server())
 
-    if CFG.AUTO_START:
-        logger.info("AUTO_START enabled")
-        STATE.current_page = max(1, int(STORE.get_setting("last_start_page", 1)))
-        STATE.worker_task = asyncio.create_task(crawl_and_process(app))
+        await app.start()
+        setup_signal_handlers()
 
-    await asyncio.Event().wait()
+        logger.info("✨ Ultra userbot online. Use /help")
+        logger.info(f"Target channel: {CFG.channel_id()}")
+
+        if CFG.AUTO_START:
+            logger.info("AUTO_START enabled")
+            STATE.current_page = max(1, int(STORE.get_setting("last_start_page", 1)))
+            STATE.worker_task = asyncio.create_task(crawl_and_process(app))
+
+        await asyncio.Event().wait()
+
+    finally:
+        if HTTP:
+            await HTTP.close()
+        try:
+            await app.stop()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     try:
