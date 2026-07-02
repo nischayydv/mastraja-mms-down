@@ -16,9 +16,10 @@ import os
 import re
 import base64
 import logging
+import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import aiohttp
 import aiofiles
@@ -165,7 +166,6 @@ async def fetch_soup(session: aiohttp.ClientSession, url: str):
 
 def extract_post_links(soup: BeautifulSoup) -> List[str]:
     links = []
-    # Agar thumb-block na mile, toh saare article tags check karenge
     articles = soup.find_all('article', class_='thumb-block') or soup.find_all('article')
     logger.info(f"🔍 Page par total {len(articles)} posts mile.")
     
@@ -179,15 +179,6 @@ def extract_post_links(soup: BeautifulSoup) -> List[str]:
                 links.append(href)
     return links
 
-def get_highest_quality_source(decoded_html: str) -> Optional[str]:
-    soup = BeautifulSoup(decoded_html, 'html.parser')
-    sources = soup.find_all('source')
-    if not sources:
-        video = soup.find('video')
-        if video and video.get('src'): return video['src']
-        return None
-    return sources[-1].get('src')
-
 async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> Optional[Dict]:
     soup = await fetch_soup(session, post_url)
     if not soup: 
@@ -200,21 +191,32 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
     
     video_url = None
     
-    # Method 1: Iframe check
+    # 🔥 FIXED EXTRACTION METHOD: Iframe URL-decode and Regex extraction
     iframe = soup.find('iframe', src=True)
     if iframe:
         src = iframe['src']
-        logger.info(f"ℹ️ Post me iframe mila: {src}")
         parsed = urlparse(src)
-        q = parsed.query
-        if q.startswith('q='):
+        qs = parse_qs(parsed.query)
+        b64_data = qs.get('q', [''])[0]
+        
+        if b64_data:
             try:
-                decoded = base64.b64decode(q[2:]).decode('utf-8')
-                video_url = get_highest_quality_source(decoded)
+                # 1. Base64 Decode karenge
+                decoded = base64.b64decode(b64_data).decode('utf-8', errors='ignore')
+                # 2. URL Decode karenge (%3C to <)
+                unquoted = urllib.parse.unquote(decoded)
+                
+                # 3. Direct Source link nikalenge Regex se
+                match = re.search(r'src=["\'](https?://[^\s"\']+\.(?:mp4|m3u8|webm)[^\s"\']*)["\']', unquoted)
+                if not match:
+                    match = re.search(r'src=["\'](https?://[^"\']+)["\']', unquoted)
+                    
+                if match:
+                    video_url = match.group(1).replace('&amp;', '&')
             except Exception as e:
-                logger.error(f"❌ Base64 decode error: {e}")
+                logger.error(f"❌ Base64/Unquote Decoder Failure: {e}")
 
-    # Method 2: Direct Video Tag check
+    # Fallback Method 2: Direct Video Tag check
     if not video_url:
         video_tag = soup.find('video')
         if video_tag:
@@ -223,21 +225,11 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
                 source = video_tag.find('source')
                 if source: video_url = source.get('src')
 
-    # Method 3: Regex search in script tags (Backup fallback)
-    if not video_url:
-        scripts = soup.find_all('script')
-        for script in scripts:
-            if script.string and ('file:' in script.string or 'source' in script.string):
-                match = re.search(r'(https?://[^\s"\']+\.(?:mp4|m3u8))', script.string)
-                if match:
-                    video_url = match.group(1)
-                    break
-
     if not video_url: 
         logger.warning(f"❌ Is link par koi playable video source nahi mila: {post_url}")
         return None
         
-    logger.info(f"🎯 Success! Video URL mil gaya: {video_url}")
+    logger.info(f"🎯 Success! Asli Video URL mil gaya: {video_url}")
     return {
         'post_id': post_id, 'title': title, 'video_url': video_url,
         'category': 'Video', 'tags': '', 'duration': '', 'views': '', 'description': ''
@@ -302,7 +294,6 @@ async def crawl_and_process(user_client: Client):
     ui_task = asyncio.create_task(live_ui_refresh_loop(user_client))
     state.cached_ids = set()
     
-    # 🔥 FIXED LOGIC: 'parsed_message' error ko poora khatam kar diya gaya hai
     try:
         logger.info("Syncing channel history for indexing cache...")
         async for msg in user_client.get_chat_history(chat_id=CHANNEL_ID, limit=100):
