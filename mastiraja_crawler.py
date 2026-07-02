@@ -1,8 +1,12 @@
 import asyncio
 import sys
 
+# Python 3.14 + Pyrogram import fix
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 import os
 import re
