@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-MastiRaja Crawler – Telegram Bot Manager (Slug-Based Live Channel Verification - No DB)
-Controls: /starttask, /pause, /resume, /stop, /status, /logs, /single, /ping, /help
+MastiRaja Crawler – Render Deployable Userbot (String Session Mode)
+Controls (Type these from your own Telegram account): 
+/starttask, /pause, /resume, /stop, /status, /logs, /single [URL], /ping
 """
 
 import asyncio
@@ -27,26 +28,10 @@ import yt_dlp
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import RPCError, Unauthorized, BadRequest, FloodWait
 from pyrogram.enums import ParseMode
-
-try:
-    from pyrogram.types.pyromod import Identifier
-    if not hasattr(Identifier, '__annotations__'):
-        setattr(Identifier, '__annotations__', {})
-    Identifier.__annotations__ = {}
-
-    _original_matches = Identifier.matches
-    def _patched_matches(self, data):
-        try:
-            return _original_matches(self, data)
-        except AttributeError:
-            return False
-    Identifier.matches = _patched_matches
-except ImportError:
-    pass
 
 load_dotenv()
 
@@ -54,13 +39,13 @@ load_dotenv()
 BASE_URL = "https://mastiraja.com"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+STRING_SESSION = os.getenv("STRING_SESSION", "BQEkPXYANAK91vnMWSBEt8SMH0tT9Rl3YqU_2iRDNErMSd8vtAlAnDU6vqSAyAkidkR79iYcAhHK30h_HxEQ_-6Mic4-CYy30yBGBZ5wwYTpZsJwifZtHN_cPHq_r0mQkznS1Kw80m3Lnj0ua8WWOVpyOJSAJ41fuEDHSU9qt5h9TehY_zHtElesGDBRUDj_Ej5NCOxDokxqsDWSjRXNLnRU30fm55jlIm1fJTHOYY73QY_96NHO1BAwBu5oaU7rG3EpNwwNFgE2bFmgYIWHTwcaail2Mqsfqo-WwQdn5ykBB44PmlBQdxxfRXhJRs843PpdlExouQ46bQJozD9ou02qjowq9wAAAAHxp25KAA").strip() # Dashboard se aayega
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
 LOG_FILE = os.getenv("LOG_FILE", "crawler.log")
 PORT = int(os.getenv("PORT", 8080))  
-AUTO_START = os.getenv("AUTO_START", "true").lower() == "true"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
+AUTO_START = os.getenv("AUTO_START", "false").lower() == "true"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 MAX_PAGES_TO_SCAN = 15  
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
@@ -72,8 +57,8 @@ if raw_channel_id.startswith("-100") or raw_channel_id.isdigit() or (raw_channel
 else:
     CHANNEL_ID = raw_channel_id
 
-if not all([API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID]):
-    raise ValueError("Missing required environment variables (API_ID, API_HASH, BOT_TOKEN, or CHANNEL_ID)")
+if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION]):
+    raise ValueError("Missing required environment variables (API_ID, API_HASH, CHANNEL_ID, or STRING_SESSION)")
 
 # ---------- Logging Setup ----------
 logger = logging.getLogger("crawler")
@@ -103,6 +88,7 @@ class CrawlerState:
         self.download_pct = 0.0
         self.upload_pct = 0.0
         self.current_page = 1
+        self.cached_ids = set() 
 
 state = CrawlerState()
 
@@ -111,7 +97,6 @@ def clean_for_tg(text: str) -> str:
     return text.replace("*", "").replace("_", "").replace("`", "").replace("<", "[").replace(">", "]")
 
 def extract_slug_id(url: str) -> str:
-    """Extracts a unique alphanumeric slug string from text-based URLs to act as post_id"""
     try:
         parsed = urlparse(url)
         slug = parsed.path.strip('/')
@@ -135,29 +120,29 @@ def build_live_status_text() -> str:
     cleaned_title = clean_for_tg(state.current_title)
     
     text = (
-        f"🔄 **MastiRaja Live Automation Monitor**\n"
+        f"🔄 **MastiRaja Render Live Monitor**\n"
         f"• System State: `{state.status.upper()}`\n"
         f"• Current Scan Page: `{state.current_page}`\n"
         f"─────────────────────\n"
     )
     
     if state.current_stage == "Scraping":
-        text += f"🛰️ **Phase:** Reading Page {state.current_page} links from site index..."
+        text += f"🛰️ **Phase:** Reading Page {state.current_page} links from site..."
     elif state.current_stage in ["Checking Channel", "Extracting Info", "Downloading", "Uploading"]:
         text += (
             f"📦 **Phase: Processing Media Pipeline**\n"
             f"• Page Queue: `{proc} / {total}` links handled\n"
             f"• Batch Ratio: `[{overall_bar}] {overall_pct:.1f}%`\n\n"
-            f"🎬 **Active Task Target:**\n"
+            f"🎬 **Active Target:**\n"
             f"• Title: `{cleaned_title[:55]}`\n"
             f"• Sub-Task: `{state.current_stage}`\n"
         )
         if state.current_stage == "Downloading":
             dl_bar = make_progress_bar(state.download_pct, length=10)
-            text += f"• **Network Input (yt-dlp):** `[{dl_bar}] {state.download_pct:.1f}%`\n"
+            text += f"• **Downloading (yt-dlp):** `[{dl_bar}] {state.download_pct:.1f}%`\n"
         elif state.current_stage == "Uploading":
             ul_bar = make_progress_bar(state.upload_pct, length=10)
-            text += f"• **Data Output (Telegram UI):** `[{ul_bar}] {state.upload_pct:.1f}%`\n"
+            text += f"• **Uploading (Telegram):** `[{ul_bar}] {state.upload_pct:.1f}%`\n"
     elif state.current_stage == "Finished":
         text += f"✅ **Run Finished!** All pages synced perfectly up to page `{state.current_page}`."
     else:
@@ -179,18 +164,9 @@ async def live_ui_refresh_loop(client: Client):
                     pass
         await asyncio.sleep(3.5)
 
-# ---------- Pure Channel Verifier (Slug Mode) ----------
+# ---------- Cache Check Logic ----------
 async def is_video_uploaded(client: Client, post_id: str) -> bool:
-    """Performs a live look up inside the Telegram Channel directly using the text slug ID string."""
-    try:
-        search_query = f"🆔 ID: {post_id}"
-        async for msg in client.search_messages(chat_id=CHANNEL_ID, query=search_query, limit=1):
-            if msg:
-                logger.info(f"🎯 Target Slug [{post_id}] found inside channel messages. Skipping download.")
-                return True
-    except Exception as e:
-        logger.error(f"Failed to execute Live Channel Search for Slug ID {post_id}: {e}")
-    return False
+    return post_id in state.cached_ids
 
 # ---------- Extraction Architecture ----------
 async def fetch_soup(session: aiohttp.ClientSession, url: str):
@@ -296,7 +272,6 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
 # ---------- Core Downloader ----------
 async def download_video(post_id: str, video_url: str, download_dir: str) -> Optional[str]:
     os.makedirs(download_dir, exist_ok=True)
-    # Sanitize slug safely for system filenames
     safe_post_id = re.sub(r'[^a-zA-Z0-9_-]', '', post_id)[:50]
     outtmpl = os.path.join(download_dir, f"{safe_post_id}_%(title)s.%(ext)s")
     downloaded_file = None
@@ -334,14 +309,13 @@ async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
     clean_dur = clean_for_tg(info['duration'])
     clean_desc = clean_for_tg(info['description'])
 
-    # Anchor Tracking Line using the full Slug String
     caption = f"📹 Title: {clean_title}\n"
     caption += f"🆔 ID: {info['post_id']}\n"
     if clean_cat: caption += f"📂 Category: {clean_cat}\n"
     if clean_tags: caption += f"🏷️ Tags: {clean_tags}\n"
     if clean_dur: caption += f"⏱️ Duration: {clean_dur}\n"
     if clean_desc: caption += f"📝 {clean_desc[:200]}...\n"
-    caption += f"\nUploaded by @NY_BOTS"
+    caption += f"\nUploaded via Cloud Userbot"
     
     try:
         def upload_progress(current, total):
@@ -356,16 +330,28 @@ async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
         logger.error(f"Telegram Upload Error: {e}")
         return False
 
-# ---------- Dynamic Verification Pipeline Engine ----------
-async def crawl_and_process(bot_client: Client):
+# ---------- Dynamic Processing Engine ----------
+async def crawl_and_process(user_client: Client):
     async with state.lock:
         if state.running: return
         state.running = True
         state.paused = False
         state.status = "running"
     
-    ui_task = asyncio.create_task(live_ui_refresh_loop(bot_client))
+    ui_task = asyncio.create_task(live_ui_refresh_loop(user_client))
     
+    state.cached_ids = set()
+    try:
+        logger.info("Syncing channel history for indexing cache...")
+        async for msg in user_client.get_chat_history(chat_id=CHANNEL_ID, limit=200):
+            if msg.caption:
+                match = re.search(r"🆔 ID:\s*([^\n\s]+)", msg.caption)
+                if match:
+                    state.cached_ids.add(match.group(1).strip())
+        logger.info(f"Cache loaded with {len(state.cached_ids)} IDs.")
+    except Exception as e:
+        logger.error(f"Failed to scan channel history logs: {e}")
+
     async with aiohttp.ClientSession() as session:
         state.current_page = 1
         
@@ -374,7 +360,7 @@ async def crawl_and_process(bot_client: Client):
             if not state.running: break
                 
             url = BASE_URL if state.current_page == 1 else f"{BASE_URL}/page/{state.current_page}/"
-            logger.info(f"Scanning target index feed page {state.current_page}...")
+            logger.info(f"Scanning page {state.current_page}...")
             state.current_stage = "Scraping"
             
             soup = await fetch_soup(session, url)
@@ -387,7 +373,6 @@ async def crawl_and_process(bot_client: Client):
             state.processed = 0
             page_had_new_video = False
             
-            # Pure One-by-One Pipeline Layout
             for target_url in links:
                 while state.paused and state.running: await asyncio.sleep(1)
                 if not state.running: break
@@ -395,17 +380,15 @@ async def crawl_and_process(bot_client: Client):
                 slug_id = extract_slug_id(target_url)
                 if slug_id:
                     state.current_stage = "Checking Channel"
-                    state.current_title = f"Checking target ID: {slug_id}"
+                    state.current_title = f"Checking ID: {slug_id}"
                     
-                    # Search using text slug tracking key layout
-                    if await is_video_uploaded(bot_client, slug_id):
-                        logger.info(f"[Page {state.current_page}] Slug [{slug_id}] already exists on channel. Skipping.")
+                    if await is_video_uploaded(user_client, slug_id):
                         state.processed += 1
                         continue 
                 
                 page_had_new_video = True
                 state.current_stage = "Extracting Info"
-                state.current_title = "Fetching remote metadata..."
+                state.current_title = "Fetching metadata..."
                 
                 info = await extract_video_info(session, target_url)
                 if not info or not info['post_id']:
@@ -416,19 +399,18 @@ async def crawl_and_process(bot_client: Client):
                 state.download_pct = 0.0
                 state.upload_pct = 0.0
                 
-                # Step 1: Download first
                 state.current_stage = "Downloading"
-                logger.info(f"Downloading Target Slug [{info['post_id']}]: {info['title']}")
+                logger.info(f"Downloading: {info['title']}")
                 filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
                 if not filepath:
                     state.processed += 1
                     continue
                     
-                # Step 2: Upload before proceeding
                 state.current_stage = "Uploading"
-                logger.info(f"Uploading Target directly to channel: {info['title']}")
-                success = await upload_video(bot_client, filepath, info)
+                logger.info(f"Uploading: {info['title']}")
+                success = await upload_video(user_client, filepath, info)
                 if success:
+                    state.cached_ids.add(info['post_id'])
                     try: os.remove(filepath)
                     except Exception: pass
                 
@@ -436,7 +418,7 @@ async def crawl_and_process(bot_client: Client):
                 await asyncio.sleep(2) 
             
             if not page_had_new_video:
-                logger.info(f"Page {state.current_page} matches live channel logs perfectly. Channel caught up.")
+                logger.info(f"Page {state.current_page} synced perfectly with cache.")
                 break
                 
             state.current_page += 1
@@ -444,6 +426,7 @@ async def crawl_and_process(bot_client: Client):
     state.current_stage = "Finished"
     state.running = False
     state.status = "stopped"
+    state.cached_ids.clear()
     await asyncio.sleep(1)
     ui_task.cancel()
 
@@ -452,20 +435,20 @@ async def start_task_cmd(client: Client, message: Message):
     if state.running:
         await message.reply("⚠️ Crawler is already running.")
         return
-    state.status_msg = await message.reply("🚀 **Initializing Slug-Based Live Tracker Layout...**")
+    state.status_msg = await message.reply("🚀 **Initializing String Session Userbot layout...**")
     state.task = asyncio.create_task(crawl_and_process(client))
 
 async def pause_cmd(client: Client, message: Message):
     if not state.running or state.paused: return
     state.paused = True
     state.status = "paused"
-    await message.reply("⏸ Crawler engine paused.")
+    await message.reply("⏸ Engine paused.")
 
 async def resume_cmd(client: Client, message: Message):
     if not state.running or not state.paused: return
     state.paused = False
     state.status = "running"
-    await message.reply("▶️ Crawler engine resumed.")
+    await message.reply("▶️ Engine resumed.")
 
 async def stop_cmd(client: Client, message: Message):
     if not state.running: return
@@ -474,20 +457,21 @@ async def stop_cmd(client: Client, message: Message):
     state.status = "stopped"
     state.current_stage = "Idle"
     if state.task and not state.task.done(): state.task.cancel()
-    await message.reply("⏹ Crawler stopped.")
+    await message.reply("⏹ Engine stopped.")
 
 async def status_cmd(client: Client, message: Message):
     await message.reply(
-        f"📊 **Engine Status (Slug Mode)**\n"
+        f"📊 **Engine Status (Render Mode)**\n"
         f"• State: `{state.status.upper()}`\n"
-        f"• Current Page: `{state.current_page}`\n"
-        f"• Processing Page Feed: `{state.processed}/{state.total_posts}`"
+        f"• Scan Page: `{state.current_page}`\n"
+        f"• Batch Queue: `{state.processed}/{state.total_posts}`\n"
+        f"• History Cache Size: `{len(state.cached_ids)}`"
     )
 
 async def logs_cmd(client: Client, message: Message):
     try:
         with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            lines = f.readlines()[-200:]
+            lines = f.readlines()[-150:]
             if not lines:
                 await message.reply("📄 System log history is currently empty.")
                 return
@@ -505,14 +489,11 @@ async def single_cmd(client: Client, message: Message):
         await message.reply("❌ Usage: /single URL")
         return
     url = args[1].strip()
-    progress_msg = await message.reply("⏳ Initializing single verification task...")
+    progress_msg = await message.reply("⏳ Initializing single sync target...")
     async with aiohttp.ClientSession() as session:
         info = await extract_video_info(session, url)
-        if not info:
-            await progress_msg.edit_text("❌ Action cancelled. Invalid video structure.")
-            return
-        if await is_video_uploaded(client, info['post_id']):
-            await progress_msg.edit_text("❌ Action cancelled. Slug already matches content on channel.")
+        if not info or not info['post_id']:
+            await progress_msg.edit_text("❌ Invalid asset structure.")
             return
         filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
         if filepath and await upload_video(client, filepath, info):
@@ -520,24 +501,10 @@ async def single_cmd(client: Client, message: Message):
             except Exception: pass
             await progress_msg.edit_text(f"✅ Uploaded: {info['title']}")
         else:
-            await progress_msg.edit_text("❌ Single processing pipeline failed.")
+            await progress_msg.edit_text("❌ Target pipeline failed.")
 
 async def ping_cmd(client: Client, message: Message):
-    await message.reply("🏓 Pong! Core engine runtime is online.")
-
-async def help_cmd(client: Client, message: Message):
-    text = (
-        "🤖 MastiRaja Smart Sync Controller (Slug Track Mode)\n\n"
-        "/starttask - Launch live-tracker interface\n"
-        "/pause - Freeze transfers\n"
-        "/resume - Unfreeze transfers\n"
-        "/stop - Terminate tracking operations\n"
-        "/status - View current live tracking progress\n"
-        "/logs - Check system console outputs\n"
-        "/single URL - Process isolated custom asset URL\n"
-        "/ping - Verify active server response"
-    )
-    await message.reply(text)
+    await message.reply("🏓 Pong! Render Userbot core is alive.")
 
 # ---------- Network Port Interface ----------
 async def http_server():
@@ -549,22 +516,24 @@ async def http_server():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, host='0.0.0.0', port=PORT).start()
-    logger.info(f"HTTP Server health check working fine on port {PORT}")
+    logger.info(f"HTTP Server web runtime online on port {PORT}")
     await asyncio.Event().wait()
 
 # ---------- Program Main Loop ----------
 async def main():
     state.http_task = asyncio.create_task(http_server())
 
+    # Initializing Client strictly using the String Session variable
     app = Client(
-        "mastiraja_bot",
-        api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-        in_memory=True, workers=20
+        "mastiraja_userbot",
+        api_id=API_ID, 
+        api_hash=API_HASH,
+        session_string=STRING_SESSION
     )
 
-    @app.on_message()
+    # filters.me means this will only respond when YOU type it from your own account
+    @app.on_message(filters.me & filters.command(["starttask", "pause", "resume", "stop", "status", "logs", "single", "ping"]))
     async def handle_msg(client, message):
-        if not message.text: return
         cmd = message.text.split()[0].lower()
         if cmd == '/starttask': await start_task_cmd(client, message)
         elif cmd == '/pause': await pause_cmd(client, message)
@@ -574,20 +543,19 @@ async def main():
         elif cmd == '/logs': await logs_cmd(client, message)
         elif cmd.startswith('/single'): await single_cmd(client, message)
         elif cmd == '/ping': await ping_cmd(client, message)
-        elif cmd == '/help': await help_cmd(client, message)
 
     try:
-        logger.info("Starting bot...")
+        logger.info("Initializing Userbot Session Login via String...")
         await app.start()
-        logger.info("Bot started successfully in Pure Channel Tracking Slug mode.")
+        logger.info("Userbot successfully authenticated and listening for commands!")
 
         if AUTO_START:
-            logger.info("Auto‑start flag is true. Invoking processing daemon...")
+            logger.info("Auto‑start triggered. Initializing background scanner...")
             state.task = asyncio.create_task(crawl_and_process(app))
 
         await asyncio.Event().wait()
     except Exception as e:
-        logger.error(f"Execution Error during runtime init: {e}")
+        logger.error(f"Runtime Init Critical Error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
