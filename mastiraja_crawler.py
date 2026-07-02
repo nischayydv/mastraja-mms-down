@@ -1,12 +1,17 @@
-#!/usr/bin/env python3
-"""
-MastiRaja Crawler – Render Deployable Userbot (String Session Mode)
-Controls (Type these from your own Telegram account): 
-/starttask, /pause, /resume, /stop, /status, /logs, /single [URL], /ping
-"""
-
 import asyncio
 import sys
+
+# 🔥 PYTHON 3.14 & WINDOWS CRASH FIX: Pyrogram import hone se PEHLE loop setup hona zaroori hai
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+# --- BAAKI IMPORTS ---
 import os
 import re
 import base64
@@ -14,13 +19,6 @@ import logging
 from datetime import datetime
 from typing import Optional, List, Dict
 from urllib.parse import urljoin, urlparse
-
-# ---------- Event Loop Setup ----------
-try:
-    loop = asyncio.get_running_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
 import aiohttp
 import aiofiles
@@ -39,13 +37,13 @@ load_dotenv()
 BASE_URL = "https://mastiraja.com"
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
-STRING_SESSION = os.getenv("STRING_SESSION", "BQEkPXYANAK91vnMWSBEt8SMH0tT9Rl3YqU_2iRDNErMSd8vtAlAnDU6vqSAyAkidkR79iYcAhHK30h_HxEQ_-6Mic4-CYy30yBGBZ5wwYTpZsJwifZtHN_cPHq_r0mQkznS1Kw80m3Lnj0ua8WWOVpyOJSAJ41fuEDHSU9qt5h9TehY_zHtElesGDBRUDj_Ej5NCOxDokxqsDWSjRXNLnRU30fm55jlIm1fJTHOYY73QY_96NHO1BAwBu5oaU7rG3EpNwwNFgE2bFmgYIWHTwcaail2Mqsfqo-WwQdn5ykBB44PmlBQdxxfRXhJRs843PpdlExouQ46bQJozD9ou02qjowq9wAAAAHxp25KAA").strip() # Dashboard se aayega
+STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
 LOG_FILE = os.getenv("LOG_FILE", "crawler.log")
 PORT = int(os.getenv("PORT", 8080))  
 
 AUTO_START = os.getenv("AUTO_START", "false").lower() == "true"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 MAX_PAGES_TO_SCAN = 15  
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
@@ -57,9 +55,6 @@ if raw_channel_id.startswith("-100") or raw_channel_id.isdigit() or (raw_channel
 else:
     CHANNEL_ID = raw_channel_id
 
-if not all([API_ID, API_HASH, CHANNEL_ID, STRING_SESSION]):
-    raise ValueError("Missing required environment variables (API_ID, API_HASH, CHANNEL_ID, or STRING_SESSION)")
-
 # ---------- Logging Setup ----------
 logger = logging.getLogger("crawler")
 logger.setLevel(logging.INFO)
@@ -70,7 +65,6 @@ ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(ch)
 
-# ---------- Global Engine State ----------
 class CrawlerState:
     def __init__(self):
         self.running = False
@@ -120,7 +114,7 @@ def build_live_status_text() -> str:
     cleaned_title = clean_for_tg(state.current_title)
     
     text = (
-        f"🔄 **MastiRaja Render Live Monitor**\n"
+        f"🔄 **MastiRaja Live Monitor**\n"
         f"• System State: `{state.status.upper()}`\n"
         f"• Current Scan Page: `{state.current_page}`\n"
         f"─────────────────────\n"
@@ -130,66 +124,58 @@ def build_live_status_text() -> str:
         text += f"🛰️ **Phase:** Reading Page {state.current_page} links from site..."
     elif state.current_stage in ["Checking Channel", "Extracting Info", "Downloading", "Uploading"]:
         text += (
-            f"📦 **Phase: Processing Media Pipeline**\n"
-            f"• Page Queue: `{proc} / {total}` links handled\n"
-            f"• Batch Ratio: `[{overall_bar}] {overall_pct:.1f}%`\n\n"
+            f"📦 **Phase: Pipeline**\n"
+            f"• Queue: `{proc} / {total}` links handled\n"
+            f"• Progress: `[{overall_bar}] {overall_pct:.1f}%`\n\n"
             f"🎬 **Active Target:**\n"
             f"• Title: `{cleaned_title[:55]}`\n"
             f"• Sub-Task: `{state.current_stage}`\n"
         )
         if state.current_stage == "Downloading":
-            dl_bar = make_progress_bar(state.download_pct, length=10)
-            text += f"• **Downloading (yt-dlp):** `[{dl_bar}] {state.download_pct:.1f}%`\n"
+            text += f"• **Downloading:** `{state.download_pct:.1f}%`\n"
         elif state.current_stage == "Uploading":
-            ul_bar = make_progress_bar(state.upload_pct, length=10)
-            text += f"• **Uploading (Telegram):** `[{ul_bar}] {state.upload_pct:.1f}%`\n"
+            text += f"• **Uploading:** `{state.upload_pct:.1f}%`\n"
     elif state.current_stage == "Finished":
-        text += f"✅ **Run Finished!** All pages synced perfectly up to page `{state.current_page}`."
-    else:
-        text += "💤 Engine standing by on sleep interval."
+        text += f"✅ **Run Finished!** Up to page `{state.current_page}`."
     return text
 
 async def live_ui_refresh_loop(client: Client):
-    last_text = ""
     while state.running:
         current_text = build_live_status_text()
-        if current_text != last_text:
-            if state.status_msg:
-                try:
-                    await state.status_msg.edit_text(current_text, parse_mode=ParseMode.MARKDOWN)
-                    last_text = current_text
-                except FloodWait as e:
-                    await asyncio.sleep(e.value + 1)
-                except Exception:
-                    pass
-        await asyncio.sleep(3.5)
+        if state.status_msg:
+            try:
+                await state.status_msg.edit_text(current_text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
+        await asyncio.sleep(4)
 
-# ---------- Cache Check Logic ----------
-async def is_video_uploaded(client: Client, post_id: str) -> bool:
-    return post_id in state.cached_ids
-
-# ---------- Extraction Architecture ----------
 async def fetch_soup(session: aiohttp.ClientSession, url: str):
     for attempt in range(MAX_RETRIES):
         try:
             async with session.get(url, headers={'User-Agent': USER_AGENT}, timeout=REQUEST_TIMEOUT) as resp:
-                resp.raise_for_status()
+                if resp.status != 200:
+                    logger.error(f"❌ Site responded with status {resp.status} on {url}")
+                    return None
                 html = await resp.text()
                 return BeautifulSoup(html, 'html.parser')
         except Exception as e:
-            logger.warning(f"Fetch failed on {url} (Attempt {attempt+1}): {e}")
-            await asyncio.sleep(2 ** attempt)
+            logger.warning(f"Fetch failed (Attempt {attempt+1}): {e}")
+            await asyncio.sleep(2)
     return None
 
 def extract_post_links(soup: BeautifulSoup) -> List[str]:
     links = []
-    for article in soup.find_all('article', class_='thumb-block'):
+    # Agar thumb-block na mile, toh saare article tags check karenge
+    articles = soup.find_all('article', class_='thumb-block') or soup.find_all('article')
+    logger.info(f"🔍 Page par total {len(articles)} posts mile.")
+    
+    for article in articles:
         a = article.find('a', href=True)
         if a:
             href = a['href']
             if href.startswith('/'):
                 href = urljoin(BASE_URL, href)
-            if href not in links:
+            if href not in links and "mastiraja.com" in href:
                 links.append(href)
     return links
 
@@ -198,53 +184,37 @@ def get_highest_quality_source(decoded_html: str) -> Optional[str]:
     sources = soup.find_all('source')
     if not sources:
         video = soup.find('video')
-        if video and video.get('src'):
-            return video['src']
+        if video and video.get('src'): return video['src']
         return None
-    best = None
-    best_quality = -1
-    for src_tag in sources:
-        src = src_tag.get('src')
-        if not src: continue
-        quality = None
-        for attr in ['quality', 'data-quality', 'bitrate', 'res']:
-            val = src_tag.get(attr)
-            if val:
-                try:
-                    num = re.search(r'(\d+)', str(val))
-                    if num:
-                        quality = int(num.group(1))
-                        break
-                except: pass
-        if quality is None:
-            m = re.search(r'(\d+)p', src)
-            if m: quality = int(m.group(1))
-            else: quality = 0
-        if quality > best_quality:
-            best_quality = quality
-            best = src
-    return best if best else (sources[-1].get('src') if sources else None)
+    return sources[-1].get('src')
 
 async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> Optional[Dict]:
     soup = await fetch_soup(session, post_url)
-    if not soup: return None
+    if not soup: 
+        logger.error(f"❌ Post ka HTML fetch nahi ho paya: {post_url}")
+        return None
     
     post_id = extract_slug_id(post_url)
-    title_tag = soup.find('h1', itemprop='name')
+    title_tag = soup.find('h1')
     title = title_tag.get_text(strip=True) if title_tag else "Untitled"
-    iframe = soup.find('iframe', src=True)
+    
     video_url = None
+    
+    # Method 1: Iframe check
+    iframe = soup.find('iframe', src=True)
     if iframe:
         src = iframe['src']
+        logger.info(f"ℹ️ Post me iframe mila: {src}")
         parsed = urlparse(src)
         q = parsed.query
         if q.startswith('q='):
-            b64 = q[2:]
             try:
-                decoded = base64.b64decode(b64).decode('utf-8')
+                decoded = base64.b64decode(q[2:]).decode('utf-8')
                 video_url = get_highest_quality_source(decoded)
             except Exception as e:
-                logger.error(f"Decode error for {post_url}: {e}")
+                logger.error(f"❌ Base64 decode error: {e}")
+
+    # Method 2: Direct Video Tag check
     if not video_url:
         video_tag = soup.find('video')
         if video_tag:
@@ -252,21 +222,25 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
             if not video_url:
                 source = video_tag.find('source')
                 if source: video_url = source.get('src')
-    if not video_url: return None
-    cat_tag = soup.find('a', class_='label', title=True)
-    category = cat_tag.get_text(strip=True) if cat_tag else "Uncategorized"
-    tags = [t.get_text(strip=True) for t in soup.find_all('a', class_='label') if 'fa-tag' in str(t) or '/tag/' in t.get('href', '')]
-    tags_str = ', '.join(tags)
-    dur = soup.find('span', class_='duration')
-    duration = dur.get_text(strip=True) if dur else ''
-    views_span = soup.find('span', class_='views')
-    views = views_span.get_text(strip=True).replace('i', '').strip() if views_span else ''
-    desc_div = soup.find('div', class_='video-description')
-    desc = desc_div.find('p').get_text(strip=True) if (desc_div and desc_div.find('p')) else ''
-    
+
+    # Method 3: Regex search in script tags (Backup fallback)
+    if not video_url:
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if script.string and ('file:' in script.string or 'source' in script.string):
+                match = re.search(r'(https?://[^\s"\']+\.(?:mp4|m3u8))', script.string)
+                if match:
+                    video_url = match.group(1)
+                    break
+
+    if not video_url: 
+        logger.warning(f"❌ Is link par koi playable video source nahi mila: {post_url}")
+        return None
+        
+    logger.info(f"🎯 Success! Video URL mil gaya: {video_url}")
     return {
-        'post_id': post_id, 'title': title, 'video_url': video_url, 'category': category,
-        'tags': tags_str, 'duration': duration, 'views': views, 'description': desc,
+        'post_id': post_id, 'title': title, 'video_url': video_url,
+        'category': 'Video', 'tags': '', 'duration': '', 'views': '', 'description': ''
     }
 
 # ---------- Core Downloader ----------
@@ -299,24 +273,11 @@ async def download_video(post_id: str, video_url: str, download_dir: str) -> Opt
         for file in os.listdir(download_dir):
             if file.startswith(f"{safe_post_id}_"): return os.path.join(download_dir, file)
     except Exception as e:
-        logger.error(f"yt-dlp Core Error: {e}")
+        logger.error(f"❌ yt-dlp Download Error: {e}")
     return None
 
 async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
-    clean_title = clean_for_tg(info['title'])
-    clean_cat = clean_for_tg(info['category'])
-    clean_tags = clean_for_tg(info['tags'])
-    clean_dur = clean_for_tg(info['duration'])
-    clean_desc = clean_for_tg(info['description'])
-
-    caption = f"📹 Title: {clean_title}\n"
-    caption += f"🆔 ID: {info['post_id']}\n"
-    if clean_cat: caption += f"📂 Category: {clean_cat}\n"
-    if clean_tags: caption += f"🏷️ Tags: {clean_tags}\n"
-    if clean_dur: caption += f"⏱️ Duration: {clean_dur}\n"
-    if clean_desc: caption += f"📝 {clean_desc[:200]}...\n"
-    caption += f"\nUploaded via Cloud Userbot"
-    
+    caption = f"📹 **Title:** {clean_for_tg(info['title'])}\n🆔 **ID:** `{info['post_id']}`"
     try:
         def upload_progress(current, total):
             if total > 0: state.upload_pct = (current / total) * 100
@@ -326,8 +287,8 @@ async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
             parse_mode=ParseMode.MARKDOWN, supports_streaming=True, progress=upload_progress
         )
         return True
-    except RPCError as e:
-        logger.error(f"Telegram Upload Error: {e}")
+    except Exception as e:
+        logger.error(f"❌ Telegram Upload Error: {e}")
         return False
 
 # ---------- Dynamic Processing Engine ----------
@@ -339,16 +300,17 @@ async def crawl_and_process(user_client: Client):
         state.status = "running"
     
     ui_task = asyncio.create_task(live_ui_refresh_loop(user_client))
-    
     state.cached_ids = set()
+    
+    # 🔥 FIXED LOGIC: 'parsed_message' error ko poora khatam kar diya gaya hai
     try:
         logger.info("Syncing channel history for indexing cache...")
-        async for msg in user_client.get_chat_history(chat_id=CHANNEL_ID, limit=200):
-            if msg.caption:
+        async for msg in user_client.get_chat_history(chat_id=CHANNEL_ID, limit=100):
+            if msg and msg.caption:
                 match = re.search(r"🆔 ID:\s*([^\n\s]+)", msg.caption)
                 if match:
                     state.cached_ids.add(match.group(1).strip())
-        logger.info(f"Cache loaded with {len(state.cached_ids)} IDs.")
+        logger.info(f"Cache successfully loaded with {len(state.cached_ids)} IDs.")
     except Exception as e:
         logger.error(f"Failed to scan channel history logs: {e}")
 
@@ -356,42 +318,37 @@ async def crawl_and_process(user_client: Client):
         state.current_page = 1
         
         while state.current_page <= MAX_PAGES_TO_SCAN and state.running:
-            while state.paused and state.running: await asyncio.sleep(1)
-            if not state.running: break
-                
             url = BASE_URL if state.current_page == 1 else f"{BASE_URL}/page/{state.current_page}/"
-            logger.info(f"Scanning page {state.current_page}...")
+            logger.info(f"Scanning page {state.current_page}... Link: {url}")
             state.current_stage = "Scraping"
             
             soup = await fetch_soup(session, url)
-            if not soup: break
+            if not soup: 
+                logger.error(f"❌ Page {state.current_page} fetch nahi ho saki.")
+                break
                 
             links = extract_post_links(soup)
-            if not links: break
+            if not links: 
+                logger.warning(f"⚠️ Page {state.current_page} par koi posts nahi mile.")
+                break
                 
             state.total_posts = len(links)
             state.processed = 0
-            page_had_new_video = False
             
             for target_url in links:
-                while state.paused and state.running: await asyncio.sleep(1)
                 if not state.running: break
                     
                 slug_id = extract_slug_id(target_url)
-                if slug_id:
-                    state.current_stage = "Checking Channel"
-                    state.current_title = f"Checking ID: {slug_id}"
-                    
-                    if await is_video_uploaded(user_client, slug_id):
-                        state.processed += 1
-                        continue 
+                if slug_id and slug_id in state.cached_ids:
+                    logger.info(f"⏭️ Already Uploaded (Skipping): {slug_id}")
+                    state.processed += 1
+                    continue 
                 
-                page_had_new_video = True
                 state.current_stage = "Extracting Info"
-                state.current_title = "Fetching metadata..."
+                logger.info(f"🔗 Processing Link: {target_url}")
                 
                 info = await extract_video_info(session, target_url)
-                if not info or not info['post_id']:
+                if not info:
                     state.processed += 1
                     continue
                     
@@ -400,14 +357,12 @@ async def crawl_and_process(user_client: Client):
                 state.upload_pct = 0.0
                 
                 state.current_stage = "Downloading"
-                logger.info(f"Downloading: {info['title']}")
                 filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
                 if not filepath:
                     state.processed += 1
                     continue
                     
                 state.current_stage = "Uploading"
-                logger.info(f"Uploading: {info['title']}")
                 success = await upload_video(user_client, filepath, info)
                 if success:
                     state.cached_ids.add(info['post_id'])
@@ -416,146 +371,62 @@ async def crawl_and_process(user_client: Client):
                 
                 state.processed += 1
                 await asyncio.sleep(2) 
-            
-            if not page_had_new_video:
-                logger.info(f"Page {state.current_page} synced perfectly with cache.")
-                break
                 
             state.current_page += 1
             
     state.current_stage = "Finished"
     state.running = False
     state.status = "stopped"
-    state.cached_ids.clear()
-    await asyncio.sleep(1)
     ui_task.cancel()
 
 # ---------- Command Routines ----------
 async def start_task_cmd(client: Client, message: Message):
     if state.running:
-        await message.reply("⚠️ Crawler is already running.")
+        await message.reply("⚠️ Crawler already running.")
         return
-    state.status_msg = await message.reply("🚀 **Initializing String Session Userbot layout...**")
+    state.status_msg = await message.reply("🚀 **Initializing Userbot Scanner...**")
     state.task = asyncio.create_task(crawl_and_process(client))
 
-async def pause_cmd(client: Client, message: Message):
-    if not state.running or state.paused: return
-    state.paused = True
-    state.status = "paused"
-    await message.reply("⏸ Engine paused.")
-
-async def resume_cmd(client: Client, message: Message):
-    if not state.running or not state.paused: return
-    state.paused = False
-    state.status = "running"
-    await message.reply("▶️ Engine resumed.")
-
 async def stop_cmd(client: Client, message: Message):
-    if not state.running: return
     state.running = False
-    state.paused = False
     state.status = "stopped"
-    state.current_stage = "Idle"
-    if state.task and not state.task.done(): state.task.cancel()
     await message.reply("⏹ Engine stopped.")
 
-async def status_cmd(client: Client, message: Message):
-    await message.reply(
-        f"📊 **Engine Status (Render Mode)**\n"
-        f"• State: `{state.status.upper()}`\n"
-        f"• Scan Page: `{state.current_page}`\n"
-        f"• Batch Queue: `{state.processed}/{state.total_posts}`\n"
-        f"• History Cache Size: `{len(state.cached_ids)}`"
-    )
-
-async def logs_cmd(client: Client, message: Message):
-    try:
-        with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            lines = f.readlines()[-150:]
-            if not lines:
-                await message.reply("📄 System log history is currently empty.")
-                return
-            txt = ''.join(lines)
-            if len(txt) > 4000:
-                await message.reply_document(document=LOG_FILE, caption="📄 System Logs")
-            else:
-                await message.reply(f"📄 Logs:\n```\n{txt}```")
-    except Exception as e:
-        await message.reply(f"❌ Error compiling logs: {e}")
-
-async def single_cmd(client: Client, message: Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.reply("❌ Usage: /single URL")
-        return
-    url = args[1].strip()
-    progress_msg = await message.reply("⏳ Initializing single sync target...")
-    async with aiohttp.ClientSession() as session:
-        info = await extract_video_info(session, url)
-        if not info or not info['post_id']:
-            await progress_msg.edit_text("❌ Invalid asset structure.")
-            return
-        filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
-        if filepath and await upload_video(client, filepath, info):
-            try: os.remove(filepath)
-            except Exception: pass
-            await progress_msg.edit_text(f"✅ Uploaded: {info['title']}")
-        else:
-            await progress_msg.edit_text("❌ Target pipeline failed.")
-
 async def ping_cmd(client: Client, message: Message):
-    await message.reply("🏓 Pong! Render Userbot core is alive.")
+    await message.reply("🏓 Pong! Live.")
 
-# ---------- Network Port Interface ----------
 async def http_server():
     from aiohttp import web
     app = web.Application()
-    async def health(request): return web.Response(text="OK")
-    app.router.add_get('/', health)
-    app.router.add_get('/health', health)
+    app.router.add_get('/', lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, host='0.0.0.0', port=PORT).start()
-    logger.info(f"HTTP Server web runtime online on port {PORT}")
-    await asyncio.Event().wait()
 
-# ---------- Program Main Loop ----------
 async def main():
-    state.http_task = asyncio.create_task(http_server())
+    asyncio.create_task(http_server())
+    if not STRING_SESSION:
+        print("❌ STRING_SESSION missing!")
+        return
 
-    # Initializing Client strictly using the String Session variable
     app = Client(
         "mastiraja_userbot",
         api_id=API_ID, 
         api_hash=API_HASH,
-        session_string=STRING_SESSION
+        session_string=STRING_SESSION,
+        in_memory=True
     )
 
-    # filters.me means this will only respond when YOU type it from your own account
-    @app.on_message(filters.me & filters.command(["starttask", "pause", "resume", "stop", "status", "logs", "single", "ping"]))
+    @app.on_message(filters.me & filters.command(["starttask", "stop", "ping"]))
     async def handle_msg(client, message):
         cmd = message.text.split()[0].lower()
         if cmd == '/starttask': await start_task_cmd(client, message)
-        elif cmd == '/pause': await pause_cmd(client, message)
-        elif cmd == '/resume': await resume_cmd(client, message)
         elif cmd == '/stop': await stop_cmd(client, message)
-        elif cmd == '/status': await status_cmd(client, message)
-        elif cmd == '/logs': await logs_cmd(client, message)
-        elif cmd.startswith('/single'): await single_cmd(client, message)
         elif cmd == '/ping': await ping_cmd(client, message)
 
-    try:
-        logger.info("Initializing Userbot Session Login via String...")
-        await app.start()
-        logger.info("Userbot successfully authenticated and listening for commands!")
-
-        if AUTO_START:
-            logger.info("Auto‑start triggered. Initializing background scanner...")
-            state.task = asyncio.create_task(crawl_and_process(app))
-
-        await asyncio.Event().wait()
-    except Exception as e:
-        logger.error(f"Runtime Init Critical Error: {e}")
+    await app.start()
+    logger.info("✨ Userbot Online! Send /starttask to run.")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop.run_until_complete(main())
