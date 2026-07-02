@@ -341,16 +341,26 @@ async def upload_video(client: Client, media_info: Dict, info: Dict) -> bool:
         def upload_progress(current, total):
             if total > 0: state.upload_pct = (current / total) * 100
 
-        await client.send_video(
-            chat_id=CHANNEL_ID, 
-            video=filepath, 
-            caption=caption,
-            duration=duration if duration > 0 else None,
-            thumb=thumb_to_pass,
-            parse_mode=ParseMode.MARKDOWN, 
-            supports_streaming=True, 
-            progress=upload_progress
-        )
+        # 🛠️ DYNAMIC KWARGS FIX: Isse Float waali packing error bypass ho jayegi
+        send_kwargs = {
+            "chat_id": CHANNEL_ID, 
+            "video": filepath, 
+            "caption": caption,
+            "parse_mode": ParseMode.MARKDOWN, 
+            "supports_streaming": True, 
+            "progress": upload_progress
+        }
+        
+        # Agar duration valid integer (> 0) hai, tabhi bhejenge
+        if duration and int(duration) > 0:
+            send_kwargs["duration"] = int(duration)
+            
+        # Agar thumbnail valid hai, tabhi bhejenge
+        if thumb_to_pass and os.path.exists(thumb_to_pass):
+            send_kwargs["thumb"] = thumb_to_pass
+
+        # Final unpacking ke sath post send karein
+        await client.send_video(**send_kwargs)
         
         if thumb_to_pass and thumb_to_pass != thumb_path and os.path.exists(thumb_to_pass):
             try: os.remove(thumb_to_pass)
@@ -391,8 +401,6 @@ async def crawl_and_process(user_client: Client):
         logger.error(f"Failed to scan channel history logs: {e}")
 
     async with aiohttp.ClientSession() as session:
-        # 🔥 FIXED DYNAMIC RESUME: Hardcoded 'page = 1' line removed. 
-        # Yeh wahi se loop start karega jo 'state.current_page' me set hoga.
         
         while state.current_page <= MAX_PAGES_TO_SCAN and state.running:
             url = BASE_URL if state.current_page == 1 else f"{BASE_URL}/page/{state.current_page}/"
@@ -452,12 +460,11 @@ async def crawl_and_process(user_client: Client):
                 state.processed += 1
                 await asyncio.sleep(2) 
                 
-            # Agle page par badhne se pehle update hoga taaki crash ya stop hone par accurate tracker bacha rahe
             if state.running:
                 state.current_page += 1
             
     if state.current_page > MAX_PAGES_TO_SCAN:
-        state.current_page = 1  # Full complete hone par hi page reset hoga fresh cycle ke liye
+        state.current_page = 1  
         
     state.current_stage = "Finished"
     state.running = False
@@ -470,14 +477,10 @@ async def start_task_cmd(client: Client, message: Message):
         await message.reply("⚠️ Crawler already running.")
         return
         
-    # 🔥 DYNAMIC ARGUMENT ROUTER
     args = message.text.split()
     if len(args) > 1 and args[1].isdigit():
-        # Agar user likhta hai `/starttask 5`, toh custom page set hoga
         state.current_page = int(args[1])
     else:
-        # Agar user sirf `/starttask` likhta hai bina parameters ke, to purana page session hi resume hoga.
-        # Agar server reboot hua hoga, toh auto-default 1 hi uthaega.
         pass
 
     state.status_msg = await message.reply(f"🚀 **Initializing Userbot Scanner from Page {state.current_page}...**")
