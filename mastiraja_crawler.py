@@ -82,7 +82,7 @@ class CrawlerState:
         self.current_title = "None"
         self.download_pct = 0.0
         self.upload_pct = 0.0
-        self.current_page = 1
+        self.current_page = 1  # Default starting page tracker
         self.cached_ids = set() 
 
 state = CrawlerState()
@@ -189,9 +189,27 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
     title_tag = soup.find('h1')
     title = title_tag.get_text(strip=True) if title_tag else "Untitled"
     
+    category = "Video"
+    cat_tag = soup.find('a', rel='category tag') or soup.find('span', class_='category') or soup.find('div', class_='post-categories')
+    if cat_tag:
+        category = cat_tag.get_text(strip=True)
+
+    tags_list = []
+    for tag in soup.find_all('a', rel='tag') or soup.find_all('span', class_='tag'):
+        cleaned_tag = re.sub(r'[^a-zA-Z0-9]', '', tag.get_text(strip=True))
+        if cleaned_tag:
+            tags_list.append(f"#{cleaned_tag}")
+    tags_str = " ".join(tags_list[:5])
+
+    description = ""
+    desc_tag = soup.find('div', class_='entry-content') or soup.find('div', class_='description') or soup.find('p', class_='description')
+    if desc_tag:
+        p_tags = desc_tag.find_all('p')
+        description = "\n".join([p.get_text(strip=True) for p in p_tags[:2]]) if p_tags else desc_tag.get_text(strip=True)
+        description = description[:200] + "..." if len(description) > 200 else description
+
     video_url = None
     
-    # 🔥 FIXED EXTRACTION METHOD: Iframe URL-decode and Regex extraction
     iframe = soup.find('iframe', src=True)
     if iframe:
         src = iframe['src']
@@ -201,12 +219,8 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
         
         if b64_data:
             try:
-                # 1. Base64 Decode karenge
                 decoded = base64.b64decode(b64_data).decode('utf-8', errors='ignore')
-                # 2. URL Decode karenge (%3C to <)
                 unquoted = urllib.parse.unquote(decoded)
-                
-                # 3. Direct Source link nikalenge Regex se
                 match = re.search(r'src=["\'](https?://[^\s"\']+\.(?:mp4|m3u8|webm)[^\s"\']*)["\']', unquoted)
                 if not match:
                     match = re.search(r'src=["\'](https?://[^"\']+)["\']', unquoted)
@@ -216,7 +230,6 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
             except Exception as e:
                 logger.error(f"❌ Base64/Unquote Decoder Failure: {e}")
 
-    # Fallback Method 2: Direct Video Tag check
     if not video_url:
         video_tag = soup.find('video')
         if video_tag:
@@ -232,20 +245,24 @@ async def extract_video_info(session: aiohttp.ClientSession, post_url: str) -> O
     logger.info(f"🎯 Success! Asli Video URL mil gaya: {video_url}")
     return {
         'post_id': post_id, 'title': title, 'video_url': video_url,
-        'category': 'Video', 'tags': '', 'duration': '', 'views': '', 'description': ''
+        'category': category, 'tags': tags_str, 'duration': 0, 'views': '', 'description': description
     }
 
-# ---------- Core Downloader ----------
-async def download_video(post_id: str, video_url: str, download_dir: str) -> Optional[str]:
+# ---------- Core Downloader with Auto Metadata ----------
+async def download_video(post_id: str, video_url: str, download_dir: str) -> Optional[Dict]:
     os.makedirs(download_dir, exist_ok=True)
     safe_post_id = re.sub(r'[^a-zA-Z0-9_-]', '', post_id)[:50]
     outtmpl = os.path.join(download_dir, f"{safe_post_id}_%(title)s.%(ext)s")
-    downloaded_file = None
+    
+    media_data = {
+        "filepath": None,
+        "duration": 0,
+        "thumbnail": None
+    }
 
     def progress_hook(d):
-        nonlocal downloaded_file
         if d['status'] == 'finished':
-            downloaded_file = d['filename']
+            media_data["filepath"] = d['filename']
             state.download_pct = 100.0
         elif d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
@@ -254,30 +271,91 @@ async def download_video(post_id: str, video_url: str, download_dir: str) -> Opt
                 state.download_pct = (downloaded / total) * 100
 
     ydl_opts = {
-        'outtmpl': outtmpl, 'quiet': True, 'no_warnings': True,
+        'outtmpl': outtmpl, 
+        'quiet': True, 
+        'no_warnings': True,
         'progress_hooks': [progress_hook],
+        'writethumbnail': True, 
         'http_headers': {'User-Agent': USER_AGENT, 'Referer': BASE_URL}
     }
 
     try:
-        await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(ydl_opts).download([video_url]))
-        if downloaded_file and os.path.exists(downloaded_file): return downloaded_file
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_dict = await asyncio.to_thread(lambda: ydl.extract_info(video_url, download=True))
+            if info_dict:
+                media_data["duration"] = int(info_dict.get("duration", 0))
+        
+        if not media_data["filepath"] or not os.path.exists(media_data["filepath"]):
+            for file in os.listdir(download_dir):
+                if file.startswith(f"{safe_post_id}_") and not file.endswith(('.jpg', '.jpeg', '.webp', '.png')):
+                    media_data["filepath"] = os.path.join(download_dir, file)
+                    break
+
         for file in os.listdir(download_dir):
-            if file.startswith(f"{safe_post_id}_"): return os.path.join(download_dir, file)
+            if file.startswith(f"{safe_post_id}_") and file.endswith(('.jpg', '.jpeg', '.webp', '.png')):
+                media_data["thumbnail"] = os.path.join(download_dir, file)
+                break
+
+        if media_data["filepath"]: 
+            return media_data
     except Exception as e:
         logger.error(f"❌ yt-dlp Download Error: {e}")
     return None
 
-async def upload_video(client: Client, filepath: str, info: Dict) -> bool:
-    caption = f"📹 **Title:** {clean_for_tg(info['title'])}\n🆔 **ID:** `{info['post_id']}`"
+# ---------- Telegram Broadcaster with Video Properties ----------
+async def upload_video(client: Client, media_info: Dict, info: Dict) -> bool:
+    category_line = f"📂 **Category:** {clean_for_tg(info['category'])}"
+    if info['tags']:
+        category_line += f" {clean_for_tg(info['tags'])}"
+        
+    description_line = f"\n\n📝 **Description:**\n{clean_for_tg(info['description'])}" if info['description'] else ""
+
+    caption = (
+        f"📹 **Title:** {clean_for_tg(info['title'])}\n"
+        f"{category_line}\n"
+        f"🆔 **ID:** `{info['post_id']}`"
+        f"{description_line}"
+    )
+    
+    filepath = media_info.get("filepath")
+    duration = media_info.get("duration", 0)
+    thumb_path = media_info.get("thumbnail")
+    thumb_to_pass = None
+
+    if thumb_path and os.path.exists(thumb_path):
+        if thumb_path.endswith(('.webp', '.png')):
+            try:
+                from PIL import Image
+                img = Image.open(thumb_path)
+                img = img.convert('RGB')
+                img.thumbnail((320, 320)) 
+                jpg_thumb_path = thumb_path.rsplit('.', 1)[0] + "_tg.jpg"
+                img.save(jpg_thumb_path, 'JPEG', quality=85)
+                thumb_to_pass = jpg_thumb_path
+            except ImportError:
+                thumb_to_pass = thumb_path 
+        else:
+            thumb_to_pass = thumb_path
+
     try:
         def upload_progress(current, total):
             if total > 0: state.upload_pct = (current / total) * 100
 
         await client.send_video(
-            chat_id=CHANNEL_ID, video=filepath, caption=caption,
-            parse_mode=ParseMode.MARKDOWN, supports_streaming=True, progress=upload_progress
+            chat_id=CHANNEL_ID, 
+            video=filepath, 
+            caption=caption,
+            duration=duration if duration > 0 else None,
+            thumb=thumb_to_pass,
+            parse_mode=ParseMode.MARKDOWN, 
+            supports_streaming=True, 
+            progress=upload_progress
         )
+        
+        if thumb_to_pass and thumb_to_pass != thumb_path and os.path.exists(thumb_to_pass):
+            try: os.remove(thumb_to_pass)
+            except Exception: pass
+            
         return True
     except Exception as e:
         logger.error(f"❌ Telegram Upload Error: {e}")
@@ -295,18 +373,26 @@ async def crawl_and_process(user_client: Client):
     state.cached_ids = set()
     
     try:
-        logger.info("Syncing channel history for indexing cache...")
-        async for msg in user_client.get_chat_history(chat_id=CHANNEL_ID, limit=100):
+        logger.info("Syncing entire channel history for absolute deduplication cache...")
+        if state.status_msg:
+            await state.status_msg.edit_text("🔍 **Checking Channel Database History to Resume... Please wait.**")
+        
+        async for msg in user_client.get_chat_history(chat_id=CHANNEL_ID, limit=None):
+            if not state.running: break
             if msg and msg.caption:
                 match = re.search(r"🆔 ID:\s*([^\n\s]+)", msg.caption)
                 if match:
                     state.cached_ids.add(match.group(1).strip())
-        logger.info(f"Cache successfully loaded with {len(state.cached_ids)} IDs.")
+        logger.info(f"Cache successfully built with {len(state.cached_ids)} registered IDs.")
+    except FloodWait as f:
+        logger.warning(f"Hit FloodWait during sync. Sleeping for {f.value} seconds...")
+        await asyncio.sleep(f.value)
     except Exception as e:
         logger.error(f"Failed to scan channel history logs: {e}")
 
     async with aiohttp.ClientSession() as session:
-        state.current_page = 1
+        # 🔥 FIXED DYNAMIC RESUME: Hardcoded 'page = 1' line removed. 
+        # Yeh wahi se loop start karega jo 'state.current_page' me set hoga.
         
         while state.current_page <= MAX_PAGES_TO_SCAN and state.running:
             url = BASE_URL if state.current_page == 1 else f"{BASE_URL}/page/{state.current_page}/"
@@ -348,23 +434,31 @@ async def crawl_and_process(user_client: Client):
                 state.upload_pct = 0.0
                 
                 state.current_stage = "Downloading"
-                filepath = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
-                if not filepath:
+                media_info = await download_video(info['post_id'], info['video_url'], DOWNLOAD_DIR)
+                if not media_info or not media_info.get("filepath"):
                     state.processed += 1
                     continue
                     
                 state.current_stage = "Uploading"
-                success = await upload_video(user_client, filepath, info)
+                success = await upload_video(user_client, media_info, info)
                 if success:
                     state.cached_ids.add(info['post_id'])
-                    try: os.remove(filepath)
+                    try: os.remove(media_info["filepath"])
                     except Exception: pass
+                    if media_info.get("thumbnail") and os.path.exists(media_info["thumbnail"]):
+                        try: os.remove(media_info["thumbnail"])
+                        except Exception: pass
                 
                 state.processed += 1
                 await asyncio.sleep(2) 
                 
-            state.current_page += 1
+            # Agle page par badhne se pehle update hoga taaki crash ya stop hone par accurate tracker bacha rahe
+            if state.running:
+                state.current_page += 1
             
+    if state.current_page > MAX_PAGES_TO_SCAN:
+        state.current_page = 1  # Full complete hone par hi page reset hoga fresh cycle ke liye
+        
     state.current_stage = "Finished"
     state.running = False
     state.status = "stopped"
@@ -375,13 +469,24 @@ async def start_task_cmd(client: Client, message: Message):
     if state.running:
         await message.reply("⚠️ Crawler already running.")
         return
-    state.status_msg = await message.reply("🚀 **Initializing Userbot Scanner...**")
+        
+    # 🔥 DYNAMIC ARGUMENT ROUTER
+    args = message.text.split()
+    if len(args) > 1 and args[1].isdigit():
+        # Agar user likhta hai `/starttask 5`, toh custom page set hoga
+        state.current_page = int(args[1])
+    else:
+        # Agar user sirf `/starttask` likhta hai bina parameters ke, to purana page session hi resume hoga.
+        # Agar server reboot hua hoga, toh auto-default 1 hi uthaega.
+        pass
+
+    state.status_msg = await message.reply(f"🚀 **Initializing Userbot Scanner from Page {state.current_page}...**")
     state.task = asyncio.create_task(crawl_and_process(client))
 
 async def stop_cmd(client: Client, message: Message):
     state.running = False
     state.status = "stopped"
-    await message.reply("⏹ Engine stopped.")
+    await message.reply(f"⏹ Engine stopped manually at Page `{state.current_page}`.")
 
 async def ping_cmd(client: Client, message: Message):
     await message.reply("🏓 Pong! Live.")
