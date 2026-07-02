@@ -82,8 +82,7 @@ class CrawlerState:
         self.current_title = "None"
         self.download_pct = 0.0
         self.upload_pct = 0.0
-        self.current_page = 1  # Default starting page tracker
-        self.cached_ids = set() 
+        self.current_page = 1  
 
 state = CrawlerState()
 
@@ -123,7 +122,7 @@ def build_live_status_text() -> str:
     
     if state.current_stage == "Scraping":
         text += f"🛰️ **Phase:** Reading Page {state.current_page} links from site..."
-    elif state.current_stage in ["Checking Channel", "Extracting Info", "Downloading", "Uploading"]:
+    elif state.current_stage in ["Live Checking", "Extracting Info", "Downloading", "Uploading"]:
         text += (
             f"📦 **Phase: Pipeline**\n"
             f"• Queue: `{proc} / {total}` links handled\n"
@@ -341,7 +340,6 @@ async def upload_video(client: Client, media_info: Dict, info: Dict) -> bool:
         def upload_progress(current, total):
             if total > 0: state.upload_pct = (current / total) * 100
 
-        # 🛠️ DYNAMIC KWARGS FIX: Isse Float waali packing error bypass ho jayegi
         send_kwargs = {
             "chat_id": CHANNEL_ID, 
             "video": filepath, 
@@ -351,15 +349,12 @@ async def upload_video(client: Client, media_info: Dict, info: Dict) -> bool:
             "progress": upload_progress
         }
         
-        # Agar duration valid integer (> 0) hai, tabhi bhejenge
         if duration and int(duration) > 0:
             send_kwargs["duration"] = int(duration)
             
-        # Agar thumbnail valid hai, tabhi bhejenge
         if thumb_to_pass and os.path.exists(thumb_to_pass):
             send_kwargs["thumb"] = thumb_to_pass
 
-        # Final unpacking ke sath post send karein
         await client.send_video(**send_kwargs)
         
         if thumb_to_pass and thumb_to_pass != thumb_path and os.path.exists(thumb_to_pass):
@@ -380,26 +375,7 @@ async def crawl_and_process(user_client: Client):
         state.status = "running"
     
     ui_task = asyncio.create_task(live_ui_refresh_loop(user_client))
-    state.cached_ids = set()
     
-    try:
-        logger.info("Syncing entire channel history for absolute deduplication cache...")
-        if state.status_msg:
-            await state.status_msg.edit_text("🔍 **Checking Channel Database History to Resume... Please wait.**")
-        
-        async for msg in user_client.get_chat_history(chat_id=CHANNEL_ID, limit=None):
-            if not state.running: break
-            if msg and msg.caption:
-                match = re.search(r"🆔 ID:\s*([^\n\s]+)", msg.caption)
-                if match:
-                    state.cached_ids.add(match.group(1).strip())
-        logger.info(f"Cache successfully built with {len(state.cached_ids)} registered IDs.")
-    except FloodWait as f:
-        logger.warning(f"Hit FloodWait during sync. Sleeping for {f.value} seconds...")
-        await asyncio.sleep(f.value)
-    except Exception as e:
-        logger.error(f"Failed to scan channel history logs: {e}")
-
     async with aiohttp.ClientSession() as session:
         
         while state.current_page <= MAX_PAGES_TO_SCAN and state.running:
@@ -424,8 +400,29 @@ async def crawl_and_process(user_client: Client):
                 if not state.running: break
                     
                 slug_id = extract_slug_id(target_url)
-                if slug_id and slug_id in state.cached_ids:
-                    logger.info(f"⏭️ Already Uploaded (Skipping): {slug_id}")
+                state.current_stage = "Live Checking"
+                
+                # 🔍 EVERY TIME LIVE PYROGRAM SEARCH ENGINE
+                already_uploaded = False
+                if slug_id:
+                    try:
+                        # Chat me direct slug_id search kar rahe hain (limit=1 fast result ke liye)
+                        async for _ in user_client.search_messages(chat_id=CHANNEL_ID, query=slug_id, limit=1):
+                            already_uploaded = True
+                            break
+                    except FloodWait as f:
+                        logger.warning(f"⚠️ Telegram Rate Limit hit! Sleeping for {f.value}s before retrying search...")
+                        await asyncio.sleep(f.value)
+                        # Retry search once after sleep
+                        async for _ in user_client.search_messages(chat_id=CHANNEL_ID, query=slug_id, limit=1):
+                            already_uploaded = True
+                            break
+                    except Exception as e:
+                        logger.error(f"❌ Live search error for ID {slug_id}: {e}")
+
+                # Check dynamic search response
+                if already_uploaded:
+                    logger.info(f"⏭️ Live Match Found! Already Uploaded (Skipping Link): {slug_id}")
                     state.processed += 1
                     continue 
                 
@@ -450,7 +447,6 @@ async def crawl_and_process(user_client: Client):
                 state.current_stage = "Uploading"
                 success = await upload_video(user_client, media_info, info)
                 if success:
-                    state.cached_ids.add(info['post_id'])
                     try: os.remove(media_info["filepath"])
                     except Exception: pass
                     if media_info.get("thumbnail") and os.path.exists(media_info["thumbnail"]):
@@ -480,10 +476,8 @@ async def start_task_cmd(client: Client, message: Message):
     args = message.text.split()
     if len(args) > 1 and args[1].isdigit():
         state.current_page = int(args[1])
-    else:
-        pass
 
-    state.status_msg = await message.reply(f"🚀 **Initializing Userbot Scanner from Page {state.current_page}...**")
+    state.status_msg = await message.reply(f"🚀 **Initializing Userbot Scanner from Page {state.current_page} with Realtime Live Search...**")
     state.task = asyncio.create_task(crawl_and_process(client))
 
 async def stop_cmd(client: Client, message: Message):
